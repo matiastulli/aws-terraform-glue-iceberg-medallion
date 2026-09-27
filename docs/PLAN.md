@@ -12,10 +12,10 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 3. Silver | | Typed, deduplicated hourly readings through an idempotent Iceberg `MERGE`, plus a quarantine table |
 | 4. Gold + data quality | | Daily aggregates with window functions, checks that fail the state machine, and SNS alerts |
 | 5. Backfill | | A Step Functions `Map` state over a date range, safe to rerun |
-| 6. Streaming | | Simulated live sensors → Kinesis → Firehose → Iceberg, with late and duplicate events |
+| 6. Near real-time | | Simulated live sensors → SQS → Lambda (pyiceberg + pyarrow) → Iceberg, with late and duplicate events (Kinesis isn't available on the Free plan) |
 | 7. Iceberg operations | | Schema evolution, partition evolution, time travel and rollback, compaction and snapshot expiry, measured with Athena bytes scanned |
 | 8. Governance | | Lake Formation permissions, LF-tags, a column/row filter, and CloudTrail audit |
-| 9. Custom Python ETL | | pyiceberg + pyarrow in a Lambda (no Spark), with a DynamoDB watermark |
+| 9. Spark Structured Streaming | | A Glue job with `trigger(availableNow)` and an S3 checkpoint over landed files, the Auto Loader equivalent, plus a DynamoDB watermark |
 | 10. Complete tests | | The remaining transformations and edge cases |
 
 **Timebox:** the interview is on 2026-09-29, two days after step 0. Steps 1–4 are day 1 and steps 5–8 are day 2. Anything that doesn't fit stays planned here.
@@ -23,7 +23,8 @@ How this project is built, one step at a time. Each step lands in its own commit
 ## Constraints that shape every step
 
 - **The AWS stack from the target job:** Glue (PySpark), Athena, Lambda, S3, Step Functions, Kinesis, Lake Formation, DynamoDB, Iceberg, Terraform. The sibling repos cover the same medallion on [Databricks + Delta](https://github.com/matiastulli/databricks-pyspark-delta-medallion) and with [dbt + Terraform + Postgres](https://github.com/matiastulli/dbt-terraform-postgres-medallion).
-- **Free account:** small data, short jobs, and nothing billed by the hour left running. Kinesis costs money even when idle, so it's created for step 6 and destroyed afterwards.
+- **AWS Free plan** (checked with `aws freetier get-account-plan-state`): $100 of credits until 2027-02-28. When they run out the account is paused rather than billed. Small data, short jobs, and nothing billed by the hour left running.
+- **Services the Free plan blocks** (`SubscriptionRequiredException`, checked 2026-09-27): Kinesis Data Streams, Firehose, MSK (Kafka) and EMR Serverless. Streaming uses SQS + Lambda instead, and Kinesis is covered in the study notes.
 - **Public repo:** no account IDs, access keys or ARNs with account IDs in committed files.
 - **CD from the laptop:** GitHub Actions only runs tests and `terraform validate`. Deploys are `terraform apply` from the laptop.
 - **Simple data, not business rules:** hourly weather readings.
@@ -45,7 +46,8 @@ Weather-station telemetry for a handful of cities:
 | Serverless notebooks | Glue Spark jobs |
 | SQL warehouse | Athena |
 | Asset Bundle jobs, schedules, table triggers | Step Functions state machines + EventBridge schedules |
-| Auto Loader + checkpoint | Kinesis + Firehose into Iceberg |
+| Auto Loader + checkpoint | Glue Spark Structured Streaming with `availableNow` + S3 checkpoint (step 9) |
+| (streaming source) | SQS → Lambda here; Kinesis / MSK in production |
 | Liquid clustering | Iceberg hidden partitioning + sort order |
 | Deletion vectors (merge-on-read) | Iceberg `write.*.mode` = copy-on-write (default) or merge-on-read |
 | `OPTIMIZE` / `VACUUM` | `rewrite_data_files` / `expire_snapshots` + `remove_orphan_files` (Athena: `OPTIMIZE` / `VACUUM`) |
@@ -70,7 +72,7 @@ Weather-station telemetry for a handful of cities:
 
 **Goal:** a CLI that can create resources, a cost guardrail, and the empty lakehouse, all in Terraform.
 
-- **Permissions (manual, root user in the console):** the CLI's IAM user has no permissions at the moment. For a personal learning account, attach `AdministratorAccess` to it. A later improvement is short-lived credentials (`aws login` or IAM Identity Center) instead of access keys.
+- **Permissions:** `AdministratorAccess` is attached to the CLI's IAM user (done in the console, 2026-09-27). A later improvement is short-lived credentials (`aws login` or IAM Identity Center) instead of access keys.
 - A budget with an email alert (for example $10), created before anything else.
 - Terraform (`terraform/`), with state in S3 and native locking (`use_lockfile`, Terraform ≥ 1.10). The state bucket itself is created once by a bootstrap step.
 - S3 buckets: `raw` (landing JSON), `lake` (Iceberg warehouse), `athena-results`. All are private, encrypted, with versioning on the lake.
@@ -102,10 +104,14 @@ Weather-station telemetry for a handful of cities:
 
 - The state machine takes `start_date` / `end_date`. A `Map` state fans out per date with a small `MaxConcurrency`. Idempotency comes from silver's `MERGE`.
 
-## 6. Streaming
+## 6. Near real-time
 
-- Simulator Lambda → Kinesis Data Stream → Firehose with the Iceberg destination → `bronze.sensor_readings_stream`, and silver picks the readings up from there.
-- The account currently returns `SubscriptionRequiredException` for Kinesis (free plan or activation). If that persists, the step is adapted.
+Kinesis, Firehose and MSK are blocked on the Free plan, so the stream is SQS:
+
+- Simulator Lambda (on an EventBridge schedule) → SQS queue → consumer Lambda (event source mapping, batch size + batching window) → append to `bronze.sensor_readings_stream` with **pyiceberg + pyarrow** against the Glue catalog, no Spark
+- `ReportBatchItemFailures` for partial batch failures, a dead-letter queue after N receives, and an alarm on DLQ depth
+- SQS standard queues are at-least-once and unordered, so duplicates and out-of-order readings reach bronze. Silver's `MERGE` on `(station_id, observed_at)` already absorbs them. That's the same contract as Kinesis, and the notes compare the two (shards, partition keys, ordering, replay, iterator age).
+- Lambda micro-batches make small files in Iceberg, which is the reason for the compaction in step 7.
 
 ## 7. Iceberg operations
 
@@ -117,8 +123,9 @@ Weather-station telemetry for a handful of cities:
 
 - Lake Formation: register the lake location, an `analyst` role that can read gold only, an LF-tag, a column filter, and CloudTrail for the audit trail
 
-## 9. Custom Python ETL
+## 9. Spark Structured Streaming
 
-- A Lambda that appends to Iceberg with pyiceberg + pyarrow (Glue catalog), with a DynamoDB watermark
+- A Glue job reading landed files with `readStream`, `trigger(availableNow=True)` and a checkpoint in S3, writing to Iceberg: Glue's equivalent of Auto Loader, billed as a batch job
+- A DynamoDB table as the pipeline's watermark/control table
 
 ## 10. Complete tests

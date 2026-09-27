@@ -13,7 +13,9 @@ A **learning-path portfolio project**: a medallion lakehouse on **AWS** (S3, Glu
 ## Environment
 
 - AWS CLI v2, region `us-east-2`, `default` profile. **Never ask for, print or handle access keys in chat.** Keep the account ID and ARNs containing it out of committed files; redact them in command output.
-- Free account: nothing billed by the hour left running (Kinesis streams, Glue interactive sessions). Keep Glue jobs small.
+- **AWS Free plan**: $100 of credits until 2027-02-28 (`aws freetier get-account-plan-state`). Nothing billed by the hour left running (Glue streaming or interactive sessions); keep Glue jobs small.
+- **Blocked on the Free plan** (`SubscriptionRequiredException`): Kinesis, Firehose, MSK and EMR Serverless. Streaming uses SQS + Lambda. Available and verified: S3, Glue (jobs, Data Catalog, Data Quality), Athena, Lambda, Step Functions, DynamoDB (+ Streams), SQS, SNS, EventBridge (+ Pipes), Lake Formation, CloudTrail, CloudWatch, S3 Tables.
+- The DynamoDB table `trucks` predates this repo. Leave it alone.
 - Local: Python 3.11 and Java 17 (Homebrew `openjdk@17`). Versions match **AWS Glue 5.1** (Spark 3.5.6, Iceberg 1.10.0).
 
 ```sh
