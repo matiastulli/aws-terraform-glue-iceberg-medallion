@@ -1,28 +1,46 @@
 # Bronze sources and the weather stations they are read for.
 # Everything downstream is derived from here: the bronze table is <system>_<table> (open_meteo_hourly), raw files land in
 # s3://<raw>/<system>/<table>/date=YYYY-MM-DD/<station_id>.json, and adding a source is a config entry plus its migration.
-# For Open-Meteo, `table` is both the API parameter that lists the variables and the response block that holds them.
+# `kind` says how to request one station's data (medallion/config.py build_request), `silver_job` which Glue job cleans
+# the source's bronze batch, and `lag_days` how far behind today the source publishes (the default run date).
+# Each source runs as its own source_pipeline execution: one failing source never blocks another.
 
+# Hourly weather. For Open-Meteo, `table` is both the API parameter that lists the variables and the response block.
 [[sources]]
 system = "open_meteo"
 table = "hourly"
+kind = "open_meteo_archive"
 api_url = "https://archive-api.open-meteo.com/v1/archive"
+silver_job = "clean_readings"
+lag_days = 7  # the archive publishes a few days late
 variables = ["temperature_2m", "relative_humidity_2m", "precipitation", "wind_speed_10m"]
+
+# City population (Wikidata P1082) with the date of each count (P585), for every station's wikidata_id.
+[[sources]]
+system = "wikidata"
+table = "population"
+kind = "wikidata_sparql"
+api_url = "https://query.wikidata.org/sparql"
+silver_job = "clean_populations"
+lag_days = 0  # the current state of Wikidata
 
 [[stations]]
 station_id = "buenos_aires"
 name = "Buenos Aires"
 latitude = -34.61
 longitude = -58.38
+wikidata_id = "Q1486"
 
 [[stations]]
 station_id = "cordoba"
 name = "Córdoba"
 latitude = -31.42
 longitude = -64.18
+wikidata_id = "Q44210"
 
 [[stations]]
 station_id = "ushuaia"
 name = "Ushuaia"
 latitude = -54.80
 longitude = -68.30
+wikidata_id = "Q44254"

@@ -32,24 +32,33 @@ terraform -chdir=terraform init -backend-config=backend.hcl && terraform -chdir=
 
 ## Pipeline
 
+Two sources, each run as its own execution of one generic state machine:
+
+| Source (bronze table) | API | Silver | Schedule |
+|---|---|---|---|
+| `open_meteo_hourly` | [Open-Meteo archive](https://open-meteo.com/en/docs/historical-weather-api): hourly temperature, humidity, precipitation, wind | `readings` (one row per station-hour) | daily |
+| `wikidata_population` | [Wikidata SPARQL](https://query.wikidata.org/): each city's population counts with their dates | `populations` (one row per station and count date) | monthly |
+
 ```
-Step Functions weather_pipeline ({"date": "YYYY-MM-DD"})
-  ├─ Lambda ingest_weather      Open-Meteo archive API → s3://<raw>/open_meteo/hourly/date=…/<station_id>.json
-  ├─ Map over sources
-  │    └─ Glue load_raw_files   raw JSON → "00_bronze".open_meteo_hourly (Iceberg, append-only)
-  └─ Glue clean_readings        the batch → "01_silver".readings (MERGE on station_id, observed_at)
-                                           + "01_silver".readings_quarantine (rejects with rejection_reasons)
+EventBridge Scheduler (one schedule per source, deployed disabled)
+  └─ Step Functions source_pipeline ({"source": "<bronze table>", "date": "YYYY-MM-DD"})
+       ├─ Lambda ingest_source   the source's API → s3://<raw>/<system>/<table>/date=…/<station_id>.json
+       ├─ Glue load_raw_files    raw JSON → "00_bronze".<source> (Iceberg, append-only)
+       └─ Glue <silver_job>      the batch → "01_silver".<entity> (MERGE on its key)
+                                             + "01_silver".<entity>_quarantine (rejects with rejection_reasons)
 ```
 
-- Sources and stations are configured in [`config/sources.toml`](config/sources.toml). Table names, raw paths and API requests are derived from it.
-- Tables are created and changed only by versioned migrations in `src/<NN_layer>/ddl/<table>/`, applied by the `apply_ddl` Glue job and recorded in `ops.schema_migrations`. Jobs check that their output matches the table exactly before writing.
+- Sources and stations are configured in [`config/sources.toml`](config/sources.toml). Table names, raw paths, API requests, the silver job and the default run date are derived from it. A failing source never blocks another.
+- Code is grouped by entity: `src/<NN_layer>/<entity>/` holds the entity's migrations (`ddl_<table>_v<NNN>_<verb>.sql`) and the job that writes it (`glue_job_<process>.py`); processes that serve every source are in `src/00_bronze/_ingestion/`.
+- Tables are created and changed only by those migrations, applied by the `apply_ddl` Glue job and recorded in `ops.schema_migrations`. Jobs check that their output matches the table exactly before writing.
 - Pure logic lives in [`src/medallion/`](src/medallion/) and is tested with `pytest` on local PySpark. [CI](.github/workflows/ci.yml) runs the tests and `terraform fmt` / `validate`; deploys are `terraform apply` from a laptop.
 
 ```sh
 export JAVA_HOME=$(/usr/libexec/java_home -v 17) && .venv/bin/pytest
 terraform -chdir=terraform plan -out=tfplan && terraform -chdir=terraform apply tfplan
 aws glue start-job-run --job-name apply_ddl
-aws stepfunctions start-execution --state-machine-arn <weather_pipeline ARN> --input '{"date":"2026-09-20"}'
+aws stepfunctions start-execution --state-machine-arn <source_pipeline ARN> --name open_meteo_hourly-2026-09-20-a --input '{"source":"open_meteo_hourly","date":"2026-09-20"}'
+aws stepfunctions start-execution --state-machine-arn <source_pipeline ARN> --name wikidata_population-2026-09-27-a --input '{"source":"wikidata_population"}'
 ```
 
 Query in Athena (workgroup `weather-lakehouse`). The numbered databases need double quotes in queries:
@@ -58,4 +67,5 @@ Query in Athena (workgroup `weather-lakehouse`). The numbered databases need dou
 SELECT station_id, cardinality(hourly.time) AS hours FROM "00_bronze".open_meteo_hourly;
 SELECT station_id, observed_at, temperature_c FROM "01_silver".readings ORDER BY observed_at DESC LIMIT 10;
 SELECT * FROM "01_silver"."readings$snapshots";   -- Iceberg metadata table: one snapshot per commit
+SELECT station_id, reference_date, population FROM "01_silver".populations ORDER BY 1, 2;
 ```

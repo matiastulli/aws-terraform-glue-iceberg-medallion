@@ -1,98 +1,33 @@
-"""Silver: one typed, validated row per station-hour, from bronze's one-row-per-station-day API responses.
+"""Silver mechanics shared by every entity (readings, populations): what makes a clean job safe to rerun.
 
-Pipeline, all pure DataFrame functions (the MERGEs stay in the Glue job):
+An entity module (readings.py, populations.py) flattens and validates its bronze rows into a DataFrame with a
+`rejection_reasons` array. From there every entity goes the same way:
 
-    flatten_hourly  -> one row per hour, source columns renamed to the column convention
-    add_observed_at -> the source's local time string -> a UTC timestamp
-    add_rejection_reasons -> every rule that fails, as a list (empty = valid)
-    dedup_latest    -> one row per (station_id, observed_at): the most recently ingested wins
-    reconcile       -> every input row is accounted for exactly once, or the job fails before writing
+    split_valid_and_rejected -> every row on exactly one side
+    dedup_latest             -> one row per key, with a deterministic winner
+    reconcile                -> every input row accounted for, or the job fails before writing
+    classify_changes         -> new / changed / unchanged against the silver table
+    rows_to_merge            -> only new and changed rows reach the MERGE (see classify_changes for why)
+    merge_sql / quarantine_merge_sql -> the MERGE statements, which the Glue job runs
 """
+
+from collections.abc import Sequence
 
 from pyspark.sql import Column, DataFrame, Window
 from pyspark.sql import functions as F
 
-KEY = ("station_id", "observed_at")
-
-# Source variable -> silver column: the unit moves into the name, so each unit is checked against the source's units.
-RENAMES = {
-    "temperature_2m": "temperature_c",
-    "relative_humidity_2m": "relative_humidity_pct",
-    "precipitation": "precipitation_mm",
-    "wind_speed_10m": "wind_speed_kmh",
-}
-EXPECTED_UNITS = {"temperature_2m": "°C", "relative_humidity_2m": "%", "precipitation": "mm", "wind_speed_10m": "km/h"}
-MEASURES = tuple(RENAMES.values())
-
-# Physically possible values per hour (not "normal" ones: a record cold snap is valid data).
-RANGES = {
-    "temperature_c": (-90.0, 60.0),
-    "relative_humidity_pct": (0, 100),
-    "precipitation_mm": (0.0, 500.0),
-    "wind_speed_kmh": (0.0, 500.0),
-}
-
-SOURCE_TIME_FORMAT = "yyyy-MM-dd'T'HH:mm"
 LINEAGE = ("_batch_id", "_source_file", "_ingested_at")
-SILVER_COLUMNS = (*KEY, *MEASURES, *LINEAGE, "_merged_at")
-QUARANTINE_COLUMNS = ("station_id", "observed_at_raw", "observed_at", *MEASURES, "rejection_reasons", *LINEAGE, "_quarantined_at")
 
 
-def flatten_hourly(bronze: DataFrame) -> DataFrame:
-    """One row per hour: bronze's `hourly` block holds parallel arrays (time[i] goes with temperature_2m[i] ...).
+def collect_reasons(df: DataFrame, rules: Sequence[tuple[Column, str]]) -> DataFrame:
+    """Adds `rejection_reasons`: the name of every (condition, name) rule whose condition is true, [] when valid.
 
-    If the arrays have different lengths, the missing values come out as null and `array_lengths_match` is false, so
-    the rows are rejected instead of silently pairing a value with the wrong hour.
+    A condition that is null (e.g. `null < 0`) doesn't count as broken, so entity rules must test nulls explicitly.
     """
-    lengths_match = F.lit(True)
-    for variable in RENAMES:
-        lengths_match = lengths_match & (F.size(f"hourly.{variable}") == F.size("hourly.time"))
-    exploded = bronze.select(
-        "*",
-        lengths_match.alias("array_lengths_match"),
-        F.posexplode("hourly.time").alias("hour_index", "observed_at_raw"),
+    return df.withColumn(
+        "rejection_reasons",
+        F.filter(F.array(*[F.when(condition, F.lit(name)) for condition, name in rules]), lambda reason: reason.isNotNull()),
     )
-    # F.get: 0-based, and null (not an error) past the end of a shorter array.
-    return exploded.select(
-        "station_id",
-        "observed_at_raw",
-        "utc_offset_seconds",
-        *[F.get(F.col(f"hourly.{variable}"), F.col("hour_index")).alias(column) for variable, column in RENAMES.items()],
-        *[F.col(f"hourly_units.{variable}").alias(f"unit_{variable}") for variable in RENAMES],
-        "array_lengths_match",
-        *LINEAGE,
-    )
-
-
-def add_observed_at(df: DataFrame) -> DataFrame:
-    """`2026-09-20T13:00` in the response's time zone -> a UTC timestamp. Unparseable -> null (then rejected)."""
-    local = F.try_to_timestamp(F.col("observed_at_raw"), F.lit(SOURCE_TIME_FORMAT))
-    return df.withColumn("observed_at", F.timestamp_seconds(F.unix_seconds(local) - F.col("utc_offset_seconds")))
-
-
-def _reason(condition: Column, reason: str) -> Column:
-    return F.when(condition, F.lit(reason))
-
-
-def add_rejection_reasons(df: DataFrame) -> DataFrame:
-    """Adds `rejection_reasons`: every rule the row breaks, or an empty array when it's valid.
-
-    Every rule is written so that a null can't make it pass: `null < 0` is null, not true, so missing values are their
-    own rule and range checks only run on present values. Units are compared null-safely (`<=>`), so a missing unit
-    is a rejection too.
-    """
-    rules = [
-        _reason(F.col("station_id").isNull(), "missing_station_id"),
-        _reason(F.col("observed_at").isNull(), "invalid_observed_at"),
-        _reason(~F.col("array_lengths_match"), "array_lengths_differ"),
-    ]
-    for column in MEASURES:
-        low, high = RANGES[column]
-        rules.append(_reason(F.col(column).isNull(), f"missing_{column}"))
-        rules.append(_reason(F.col(column).isNotNull() & ~F.col(column).between(low, high), f"out_of_range_{column}"))
-    for variable, unit in EXPECTED_UNITS.items():
-        rules.append(_reason(~F.col(f"unit_{variable}").eqNullSafe(F.lit(unit)), f"unexpected_unit_{RENAMES[variable]}"))
-    return df.withColumn("rejection_reasons", F.filter(F.array(*rules), lambda reason: reason.isNotNull()))
 
 
 def split_valid_and_rejected(df: DataFrame) -> tuple[DataFrame, DataFrame]:
@@ -101,11 +36,12 @@ def split_valid_and_rejected(df: DataFrame) -> tuple[DataFrame, DataFrame]:
     return df.where(is_valid), df.where(~is_valid)
 
 
-def dedup_latest(valid: DataFrame) -> DataFrame:
-    """One row per (station_id, observed_at). The most recently ingested wins; ties are broken on batch and file, so
-    the result never depends on how Spark happened to order the rows."""
-    latest_first = Window.partitionBy(*KEY).orderBy(F.desc("_ingested_at"), F.desc("_batch_id"), F.desc("_source_file"))
-    return valid.withColumn("_rank", F.row_number().over(latest_first)).where("_rank = 1").drop("_rank")
+def dedup_latest(valid: DataFrame, key: Sequence[str], prefer: Sequence[Column] = ()) -> DataFrame:
+    """One row per key. `prefer` orders candidates first (e.g. Wikidata's preferred rank); then the most recently
+    ingested wins, with ties broken on batch and file, so the winner never depends on how Spark ordered the rows."""
+    order = [*prefer, F.desc("_ingested_at"), F.desc("_batch_id"), F.desc("_source_file")]
+    ranked = valid.withColumn("_rank", F.row_number().over(Window.partitionBy(*key).orderBy(*order)))
+    return ranked.where("_rank = 1").drop("_rank")
 
 
 def reconcile(input_rows: int, valid_rows: int, rejected_rows: int, unique_rows: int) -> dict[str, int]:
@@ -122,29 +58,21 @@ def reconcile(input_rows: int, valid_rows: int, rejected_rows: int, unique_rows:
     return counts
 
 
-def to_silver(unique: DataFrame) -> DataFrame:
-    return unique.withColumn("_merged_at", F.current_timestamp()).select(*SILVER_COLUMNS)
-
-
-def to_quarantine(rejected: DataFrame) -> DataFrame:
-    return rejected.withColumn("_quarantined_at", F.current_timestamp()).select(*QUARANTINE_COLUMNS)
-
-
-def classify_changes(updates: DataFrame, current: DataFrame) -> DataFrame:
+def classify_changes(updates: DataFrame, current: DataFrame, key: Sequence[str], values: Sequence[str]) -> DataFrame:
     """Adds `change`: `new` (key not in silver), `changed` (different values, from data at least as recent), or
     `unchanged` (same values, or older data that must not overwrite newer).
 
     Only new and changed rows are sent to the MERGE. With copy-on-write, Iceberg rewrites every data file that holds a
     *matched* key, even when the WHEN MATCHED condition is false for all of them: a rerun would rewrite the whole
-    partition and commit a snapshot while changing nothing (measured locally, see docs/PLAN.md step 3).
+    partition and commit a snapshot while changing nothing (measured, see docs/PLAN.md step 3).
     """
-    existing = current.select(*[F.col(k).alias(f"_current_{k}") for k in KEY], *[F.col(c).alias(f"_current_{c}") for c in (*MEASURES, "_ingested_at")])
-    joined = updates.join(existing, [F.col(k) == F.col(f"_current_{k}") for k in KEY], "left")
+    existing = current.select(*[F.col(c).alias(f"_current_{c}") for c in (*key, *values, "_ingested_at")])
+    joined = updates.join(existing, [F.col(k) == F.col(f"_current_{k}") for k in key], "left")
     values_differ = F.lit(False)
-    for column in MEASURES:
+    for column in values:
         values_differ = values_differ | ~F.col(column).eqNullSafe(F.col(f"_current_{column}"))
     change = (
-        F.when(F.col("_current_station_id").isNull(), "new")
+        F.when(F.col(f"_current_{key[0]}").isNull(), "new")
         .when(values_differ & (F.col("_ingested_at") >= F.col("_current__ingested_at")), "changed")
         .otherwise("unchanged")
     )
@@ -158,3 +86,29 @@ def change_counts(classified: DataFrame) -> dict[str, int]:
 
 def rows_to_merge(classified: DataFrame) -> DataFrame:
     return classified.where(F.col("change") != "unchanged").drop("change")
+
+
+def merge_sql(table: str, source_view: str, key: Sequence[str], values: Sequence[str]) -> str:
+    """MERGE on the key: insert new keys; update a match only when its values differ and the incoming data isn't
+    older, so a late backfill can't overwrite newer data. The conditions repeat classify_changes, so the statement
+    stays correct on its own (e.g. if another writer committed in between)."""
+    on = " AND ".join(f"t.{k} = s.{k}" for k in key)
+    values_differ = " OR ".join(f"NOT (t.{c} <=> s.{c})" for c in values)
+    return (
+        f"MERGE INTO {table} t\nUSING {source_view} s\nON {on}\n"
+        f"WHEN MATCHED AND s._ingested_at >= t._ingested_at AND ({values_differ}) THEN UPDATE SET *\n"
+        "WHEN NOT MATCHED THEN INSERT *"
+    )
+
+
+def quarantine_merge_sql(table: str, source_view: str, match_on: Sequence[str]) -> str:
+    """Insert-only MERGE for a quarantine log. `<=>` (null-safe equality): a reject may have null values, and
+    `null = null` never matches, so a rerun would insert the same reject again."""
+    on = " AND ".join(f"t.{c} <=> s.{c}" for c in match_on)
+    return f"MERGE INTO {table} t\nUSING {source_view} s\nON {on}\nWHEN NOT MATCHED THEN INSERT *"
+
+
+def new_rejects(rejects: DataFrame, quarantine: DataFrame, match_on: Sequence[str]) -> DataFrame:
+    """Rejects not yet in the quarantine table (null-safe), so an empty quarantine MERGE can be skipped."""
+    condition = [rejects[c].eqNullSafe(quarantine[c]) for c in match_on]
+    return rejects.join(quarantine.select(*match_on), condition, "left_anti")

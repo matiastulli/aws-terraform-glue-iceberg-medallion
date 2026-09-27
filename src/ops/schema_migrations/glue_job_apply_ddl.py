@@ -1,6 +1,6 @@
 """Glue job: apply pending DDL migrations. Tables are created and changed only here, never by the jobs that write to them.
 
-Reads the write-once SQL files in src/<NN_layer>/ddl/<table>/ (deployed to S3 by Terraform), applies the ones that
+Reads the write-once SQL files src/<NN_layer>/<entity>/ddl_<table>_v<NNN>_<verb>.sql (deployed to S3 by Terraform), applies the ones that
 haven't run yet, and records each in ops.schema_migrations. What runs, and in which order, is decided and unit-tested
 in src/medallion/migrations.py; this job only executes and records.
 
@@ -30,7 +30,7 @@ dry_run = args["dry_run"] == "true"
 spark = SparkSession.builder.getOrCreate()
 history_table = f"`{values['catalog']}`.`{values['ops_db']}`.{HISTORY_TABLE}"
 
-# The migration files, keyed by their path relative to src/ (s3://<artifacts>/ddl/00_bronze/ddl/<table>/v001_create.sql).
+# The migration files, keyed by their path relative to src/ (s3://<artifacts>/ddl/01_silver/readings/ddl_readings_v001_create.sql).
 bucket, prefix = split_s3_uri(args["ddl_prefix"])
 s3 = boto3.client("s3")
 keys = [obj["Key"] for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix) for obj in page.get("Contents", [])]

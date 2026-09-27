@@ -1,7 +1,7 @@
 """config/sources.toml: the bronze sources and the stations they are read for.
 
-Names are derived, never configured: a source's bronze table, raw prefix and API request all come from its
-`system` and `table`. No pyspark here: the ingest Lambda imports this module.
+Names are derived, never configured: a source's bronze table and raw prefix come from its `system` and `table`, and
+its `kind` says how to ask the API for one station (build_request). No pyspark here: the ingest Lambda imports this.
 """
 
 import datetime as dt
@@ -11,14 +11,31 @@ import urllib.parse
 from dataclasses import dataclass
 
 NAME = re.compile(r"^[a-z][a-z0-9_]*$")
+WIKIDATA_ID = re.compile(r"^Q[1-9][0-9]*$")
+KINDS = ("open_meteo_archive", "wikidata_sparql")
+# Wikidata's policy asks clients for a descriptive User-Agent; anonymous ones get throttled or blocked.
+USER_AGENT = "weather-lakehouse/0.1 (https://github.com/matiastulli/aws-terraform-glue-iceberg-medallion)"
+
+# Population (P1082) statements with their point in time (P585, optional on Wikidata) and rank. The variable names are
+# the Wikidata property names, so bronze mirrors the source; silver renames them.
+WIKIDATA_POPULATION_QUERY = """SELECT ?population ?point_in_time ?rank WHERE {{
+  wd:{wikidata_id} p:P1082 ?statement .
+  ?statement ps:P1082 ?population ;
+             wikibase:rank ?rank .
+  OPTIONAL {{ ?statement pq:P585 ?point_in_time }}
+}}
+ORDER BY ?point_in_time"""
 
 
 @dataclass(frozen=True)
 class Source:
     system: str
     table: str
+    kind: str
     api_url: str
-    variables: tuple[str, ...]
+    silver_job: str  # the Glue job that cleans this source's bronze batch into silver
+    lag_days: int  # how far behind today the source publishes: the default run date is today - lag_days
+    variables: tuple[str, ...] = ()  # open_meteo_archive only
 
     @property
     def bronze_table(self) -> str:
@@ -32,6 +49,7 @@ class Station:
     name: str
     latitude: float
     longitude: float
+    wikidata_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -51,21 +69,31 @@ def parse_config(text: str) -> Config:
     data = tomllib.loads(text)
     problems = []
     sources = tuple(
-        Source(s["system"], s["table"], s["api_url"], tuple(s["variables"])) for s in data.get("sources", [])
+        Source(s["system"], s["table"], s["kind"], s["api_url"], s["silver_job"], int(s["lag_days"]), tuple(s.get("variables", [])))
+        for s in data.get("sources", [])
     )
     stations = tuple(
-        Station(s["station_id"], s["name"], float(s["latitude"]), float(s["longitude"])) for s in data.get("stations", [])
+        Station(s["station_id"], s["name"], float(s["latitude"]), float(s["longitude"]), s.get("wikidata_id"))
+        for s in data.get("stations", [])
     )
     if not sources:
         problems.append("no [[sources]]")
     if not stations:
         problems.append("no [[stations]]")
     for source in sources:
-        for field, value in (("system", source.system), ("table", source.table), *(("variable", v) for v in source.variables)):
+        if source.lag_days < 0:
+            problems.append(f"source {source.bronze_table} has a negative lag_days")
+        for field, value in (("system", source.system), ("table", source.table), ("silver_job", source.silver_job), *(("variable", v) for v in source.variables)):
             if not NAME.match(value):
                 problems.append(f"source {field} {value!r} must match {NAME.pattern}")
-        if not source.variables:
+        if source.kind not in KINDS:
+            problems.append(f"source {source.bronze_table} has kind {source.kind!r}; known kinds: {list(KINDS)}")
+        if source.kind == "open_meteo_archive" and not source.variables:
             problems.append(f"source {source.bronze_table} has no variables")
+        if source.kind == "wikidata_sparql":
+            for station in stations:
+                if not WIKIDATA_ID.match(station.wikidata_id or ""):
+                    problems.append(f"station {station.station_id} needs a wikidata_id like Q1486 for source {source.bronze_table}")
     for station in stations:
         if not NAME.match(station.station_id):
             problems.append(f"station_id {station.station_id!r} must match {NAME.pattern}")
@@ -88,10 +116,12 @@ def raw_key(source: Source, date: dt.date, station: Station) -> str:
     return f"{raw_prefix(source, date)}{station.station_id}.json"
 
 
-def request_url(source: Source, station: Station, date: dt.date) -> str:
-    """One station-day from the Open-Meteo archive, in UTC."""
-    query = urllib.parse.urlencode(
-        {
+def build_request(source: Source, station: Station, date: dt.date) -> tuple[str, dict[str, str]]:
+    """The GET request (URL, headers) that fetches one station's data for one run date."""
+    headers = {"User-Agent": USER_AGENT}
+    if source.kind == "open_meteo_archive":
+        # One station-day from the archive, in UTC. `table` (hourly) is both the parameter and the response block.
+        query = {
             "latitude": station.latitude,
             "longitude": station.longitude,
             "start_date": date.isoformat(),
@@ -99,15 +129,21 @@ def request_url(source: Source, station: Station, date: dt.date) -> str:
             source.table: ",".join(source.variables),
             "timezone": "UTC",
         }
-    )
-    return f"{source.api_url}?{query}"
+    elif source.kind == "wikidata_sparql":
+        # Every population statement Wikidata has for the station's city, as it stands today: the run date only decides
+        # where the response lands in raw, so bronze keeps what Wikidata said on each run.
+        query = {"query": WIKIDATA_POPULATION_QUERY.format(wikidata_id=station.wikidata_id), "format": "json"}
+        headers["Accept"] = "application/sparql-results+json"
+    else:
+        raise ValueError(f"unknown source kind {source.kind!r}")
+    return f"{source.api_url}?{urllib.parse.urlencode(query)}", headers
 
 
-def run_date(requested: str | None, today: dt.date) -> dt.date:
-    """The date to ingest: the requested one, or a week ago, because the archive API lags a few days behind."""
+def run_date(requested: str | None, today: dt.date, lag_days: int) -> dt.date:
+    """The date to ingest: the requested one, or today minus the source's publishing lag."""
     if requested:
         return dt.date.fromisoformat(requested)
-    return today - dt.timedelta(days=7)
+    return today - dt.timedelta(days=lag_days)
 
 
 def split_s3_uri(uri: str) -> tuple[str, str]:

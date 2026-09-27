@@ -20,7 +20,7 @@ locals {
   }
   glue_jobs = {
     apply_ddl = {
-      description = "Apply pending DDL migrations (src/<NN_layer>/ddl) and record them in ops.schema_migrations"
+      description = "Apply pending DDL migrations (src/<NN_layer>/<entity>/ddl_*.sql) and record them in ops.schema_migrations"
       arguments = merge(local.database_arguments, {
         "--ddl_prefix" = "s3://${local.artifacts}/ddl/"
         "--dry_run"    = "false"
@@ -41,6 +41,15 @@ locals {
     }
     clean_readings = {
       description = "Flatten, validate and MERGE one bronze batch (--batch_id) into 01_silver.readings, rejects to readings_quarantine"
+      arguments = {
+        "--catalog"   = local.catalog
+        "--bronze_db" = aws_glue_catalog_database.this["00_bronze"].name
+        "--silver_db" = aws_glue_catalog_database.this["01_silver"].name
+        "--batch_id"  = "set-per-run"
+      }
+    }
+    clean_populations = {
+      description = "Validate and MERGE one bronze batch (--batch_id) of Wikidata population statements into 01_silver.populations"
       arguments = {
         "--catalog"   = local.catalog
         "--bronze_db" = aws_glue_catalog_database.this["00_bronze"].name

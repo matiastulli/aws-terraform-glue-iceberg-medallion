@@ -3,6 +3,7 @@ data "aws_iam_policy_document" "assume" {
     glue           = "glue.amazonaws.com"
     lambda         = "lambda.amazonaws.com"
     step_functions = "states.amazonaws.com"
+    scheduler      = "scheduler.amazonaws.com"
   }
   statement {
     actions = ["sts:AssumeRole"]
@@ -77,11 +78,11 @@ resource "aws_iam_role" "step_functions" {
 data "aws_iam_policy_document" "step_functions" {
   statement {
     actions   = ["lambda:InvokeFunction"]
-    resources = [aws_lambda_function.ingest_weather.arn]
+    resources = [aws_lambda_function.ingest_source.arn]
   }
   statement {
     actions   = ["glue:StartJobRun", "glue:GetJobRun", "glue:GetJobRuns", "glue:BatchStopJobRun"]
-    resources = [aws_glue_job.this["load_raw_files"].arn, aws_glue_job.this["clean_readings"].arn]
+    resources = [for job in ["load_raw_files", "clean_readings", "clean_populations"] : aws_glue_job.this[job].arn]
   }
 }
 
@@ -89,4 +90,23 @@ resource "aws_iam_role_policy" "step_functions" {
   name   = "run-pipeline"
   role   = aws_iam_role.step_functions.id
   policy = data.aws_iam_policy_document.step_functions.json
+}
+
+# EventBridge Scheduler: start source_pipeline executions, nothing else.
+resource "aws_iam_role" "scheduler" {
+  name               = "${var.project}-scheduler"
+  assume_role_policy = data.aws_iam_policy_document.assume["scheduler"].json
+}
+
+data "aws_iam_policy_document" "scheduler" {
+  statement {
+    actions   = ["states:StartExecution"]
+    resources = [aws_sfn_state_machine.source_pipeline.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "scheduler" {
+  name   = "start-source-pipeline"
+  role   = aws_iam_role.scheduler.id
+  policy = data.aws_iam_policy_document.scheduler.json
 }

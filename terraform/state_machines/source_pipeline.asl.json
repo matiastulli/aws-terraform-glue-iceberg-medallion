@@ -1,0 +1,92 @@
+{
+  "Comment": "One source: ingest into raw, load into its bronze table, clean the batch into silver. Input: {\"source\": \"<bronze table>\", \"date\": \"YYYY-MM-DD\"} (date optional). _batch_id is the execution name.",
+  "StartAt": "Ingest",
+  "States": {
+    "Ingest": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ingest_function}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "source.$": "$.Payload.source",
+        "date.$": "$.Payload.date",
+        "files.$": "$.Payload.files",
+        "silver_job.$": "$.Payload.silver_job"
+      },
+      "ResultPath": "$.ingest",
+      "Retry": [
+        {
+          "Comment": "Only transient errors: rewriting the same raw keys is idempotent. A bad input (ValueError, KeyError) fails at once instead of being retried",
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException", "HTTPError", "URLError", "TimeoutError", "States.Timeout"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }],
+      "Next": "LoadRawFiles"
+    },
+    "LoadRawFiles": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${load_job}",
+        "Arguments": {
+          "--source.$": "$.ingest.source",
+          "--date.$": "$.ingest.date",
+          "--batch_id.$": "$$.Execution.Name"
+        }
+      },
+      "ResultSelector": {
+        "job_run_id.$": "$.Id",
+        "execution_seconds.$": "$.ExecutionTime"
+      },
+      "ResultPath": "$.load",
+      "Retry": [
+        {
+          "Comment": "Only errors from before the job ran. A failed job isn't retried: bronze appends, so a retry after a commit would load the batch twice",
+          "ErrorEquals": ["Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException", "Glue.InternalServiceException"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }],
+      "Next": "Clean"
+    },
+    "Clean": {
+      "Type": "Task",
+      "Comment": "The source's silver job, named in config/sources.toml (silver_job) and returned by the Lambda",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName.$": "$.ingest.silver_job",
+        "Arguments": {
+          "--batch_id.$": "$$.Execution.Name"
+        }
+      },
+      "ResultSelector": {
+        "job_run_id.$": "$.Id",
+        "execution_seconds.$": "$.ExecutionTime"
+      },
+      "ResultPath": "$.clean",
+      "Retry": [
+        {
+          "Comment": "Same pre-run errors. A failed run would be safe to retry (the MERGE is idempotent), but a failure is usually a bug or a failed check, which a retry only repeats",
+          "ErrorEquals": ["Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException", "Glue.InternalServiceException"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }],
+      "End": true
+    },
+    "Failed": {
+      "Type": "Fail",
+      "Error": "SourcePipelineFailed",
+      "Comment": "Step 4 adds an SNS alert here"
+    }
+  }
+}

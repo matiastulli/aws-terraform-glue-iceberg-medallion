@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits. Later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–3 done, step 4 next
+**Status:** steps 0–3b done, step 4 next
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -10,6 +10,7 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 1. AWS access + foundations | ✅ Done | IAM permissions, a budget alarm, and Terraform for S3, Glue databases and an Athena workgroup |
 | 2. Thin end-to-end | ✅ Done | Lambda ingestion → S3 → Glue job → bronze Iceberg, run by Step Functions, with CI on GitHub Actions |
 | 3. Silver | ✅ Done | Typed, deduplicated hourly readings through an idempotent Iceberg `MERGE`, plus a quarantine table |
+| 3b. Second source: population | ✅ Done | City population from Wikidata through the same stack, so gold can show how many people the weather affects |
 | 4. Gold + data quality | ⏳ Next | Daily aggregates with window functions, checks that fail the state machine, and SNS alerts |
 | 5. Backfill | | A Step Functions `Map` state over a date range, safe to rerun |
 | 6. Near real-time | | Simulated live sensors → SQS → Lambda (pyiceberg + pyarrow) → Iceberg, with late and duplicate events (Kinesis isn't available on the Free plan) |
@@ -131,11 +132,11 @@ Adopted on 2026-09-27, before any table exists, from the sibling repo's [CLAUDE.
 Built:
 - [`config/sources.toml`](../config/sources.toml) (renamed from the planned `stations.toml`, since it holds the sources too): the source `open_meteo` + `hourly` and three stations. Everything is derived from `system` + `table`: the bronze table `open_meteo_hourly`, the raw prefix `open_meteo/hourly/date=YYYY-MM-DD/`, and the API request (for Open-Meteo, `table` is both the request parameter listing the variables and the response block holding them). So a `daily` source would be config plus a migration, with no new code.
 - [`src/medallion/`](../src/medallion/): `config.py` (parsing, validation, derived names; no pyspark, because the Lambda imports it), `bronze.py` (read schema = table schema minus the added columns; `station_id` from the file name, and a misnamed file fails the load), `contract.py`, and `migrations.py` (ported from the sibling repo without its `catalog/` folder, because Terraform owns the databases here). **28 tests**, all on the high-risk logic.
-- Migrations: [`src/00_bronze/ddl/open_meteo_hourly/v001_create.sql`](../src/00_bronze/ddl/open_meteo_hourly/v001_create.sql). Bronze mirrors the API response: one row per station-day, with the `hourly` block of parallel arrays kept as a struct (silver flattens it), plus `station_id` and `_batch_id`, `_ingested_at`, `_source_file`. It's partitioned by `days(_ingested_at)`, with `format-version` 2 and zstd.
-- Glue job [`apply_ddl`](../src/ops/glue_job/apply_ddl.py): reads the migrations from `s3://<artifacts>/ddl/`, and creates `ops.schema_migrations` itself.
-- Lambda [`ingest_weather`](../src/00_bronze/lambda/ingest_weather.py): writes each API response untouched to the raw bucket. Rewriting the same key makes reruns safe.
-- Glue job [`load_raw_files`](../src/00_bronze/glue_job/load_raw_files.py): generic over sources (`--source`, `--date`, `--batch_id`). It fails if the table is missing, reads the JSON with the table's schema (`FAILFAST`), checks the contract, and appends.
-- Step Functions `weather_pipeline` ([ASL](../terraform/state_machines/weather_pipeline.asl.json)): Ingest → `Map` over the sources the Lambda returns → `glue:startJobRun.sync`, with a catch to a `Fail` state. `_batch_id` is the execution name.
+- Migrations: [`src/00_bronze/ddl/open_meteo_hourly/v001_create.sql`](../src/00_bronze/open_meteo_hourly/ddl_open_meteo_hourly_v001_create.sql). Bronze mirrors the API response: one row per station-day, with the `hourly` block of parallel arrays kept as a struct (silver flattens it), plus `station_id` and `_batch_id`, `_ingested_at`, `_source_file`. It's partitioned by `days(_ingested_at)`, with `format-version` 2 and zstd.
+- Glue job [`apply_ddl`](../src/ops/schema_migrations/glue_job_apply_ddl.py): reads the migrations from `s3://<artifacts>/ddl/`, and creates `ops.schema_migrations` itself.
+- Lambda `ingest_weather` (since step 3b the generic [`ingest_source`](../src/00_bronze/_ingestion/lambda_ingest_source.py)): writes each API response untouched to the raw bucket. Rewriting the same key makes reruns safe.
+- Glue job [`load_raw_files`](../src/00_bronze/_ingestion/glue_job_load_raw_files.py): generic over sources (`--source`, `--date`, `--batch_id`). It fails if the table is missing, reads the JSON with the table's schema (`FAILFAST`), checks the contract, and appends.
+- Step Functions `weather_pipeline` (replaced by `source_pipeline` in step 3b): Ingest → `Map` over the sources the Lambda returns → `glue:startJobRun.sync`, with a catch to a `Fail` state. `_batch_id` is the execution name.
 - Terraform: an `artifacts` bucket (scripts, the zipped `medallion` package, DDL, config, each uploaded with a content-hash `etag`), three IAM roles (Glue, Lambda, Step Functions), the two Glue 5.1 jobs (2 × G.1X, `max_retries = 0` because Step Functions owns retries), the Lambda (Python 3.11) with 14-day logs, and the state machine.
 - **Layout by runtime** (the user's request, for readability): each layer folder has one subfolder per place the code runs, so the folder tells you where a file executes:
   ```
@@ -176,8 +177,8 @@ Built:
   - `dedup_latest`: one row per key, most recently ingested first, with deterministic tie-breaks
   - `reconcile`: input = valid + rejected, and valid = unique + duplicates, or the job fails before writing
   - `classify_changes`: new / changed / unchanged against silver
-- Migrations: [`readings`](../src/01_silver/ddl/readings/v001_create.sql) (`NOT NULL` columns, `days(observed_at)`, explicit copy-on-write, `WRITE ORDERED BY station_id, observed_at` as a second statement) and [`readings_quarantine`](../src/01_silver/ddl/readings_quarantine/v001_create.sql) (nullable values, `rejection_reasons`, `observed_at_raw`).
-- Glue job [`clean_readings`](../src/01_silver/glue_job/clean_readings.py): reads the bronze rows of `--batch_id`, checks both contracts, and MERGEs.
+- Migrations: [`readings`](../src/01_silver/readings/ddl_readings_v001_create.sql) (`NOT NULL` columns, `days(observed_at)`, explicit copy-on-write, `WRITE ORDERED BY station_id, observed_at` as a second statement) and [`readings_quarantine`](../src/01_silver/readings/ddl_readings_quarantine_v001_create.sql) (nullable values, `rejection_reasons`, `observed_at_raw`).
+- Glue job [`clean_readings`](../src/01_silver/readings/glue_job_clean_readings.py): reads the bronze rows of `--batch_id`, checks both contracts, and MERGEs.
   - **Silver:** a new key is inserted. A matched key is updated only when its values differ *and* the incoming data isn't older (`s._ingested_at >= t._ingested_at`), so a late backfill can't overwrite newer data.
   - **Quarantine:** a log per batch, merged on `(station_id, observed_at_raw, _batch_id)` with `<=>`, so null keys still match on a rerun.
 - `weather_pipeline` gained a `CleanReadings` step after the loads, with `--batch_id` = the execution name.
@@ -200,9 +201,70 @@ Verified:
 - `F.get(array, i)` (Spark 3.4+) is 0-based and returns null past the end, even with ANSI mode on. `element_at` is 1-based and throws under ANSI.
 - The Step Functions `Map` fans out the loads, and silver runs once after all of them, cleaning everything the execution loaded (one `_batch_id`).
 
+## 3b. Second source: population (Wikidata) ✅
+
+**Goal (the user's request):** gold can show how many people live where the weather happens. A second source system goes through the same stack (Lambda → raw → `load_raw_files` → bronze → silver), which tests whether bronze really is config-driven.
+
+**Source, compared on 2026-09-27 (the user chose Wikidata):**
+
+| | Open-Meteo Geocoding (GeoNames) | Wikidata SPARQL |
+|---|---|---|
+| Buenos Aires / Córdoba / Ushuaia | 2,891,082 / 2,106,734 / 56,825 | 2022 census: 3,121,707 / 1,505,250 / 82,615 |
+| Dated | No (one number, ≈ 2010) | Every census back to 1887 (`P1082` population, `P585` point in time) |
+
+Wikidata is a different source system with a different response shape, and its values are dated, so gold has to pick the population in effect on each day (an as-of join).
+
+**Plan:**
+- `config/sources.toml`: a second source (`system = "wikidata"`, `table = "population"` → `wikidata_population`) and a `wikidata_id` per station. Sources get a `kind` (`open_meteo_archive` | `wikidata_sparql`), because each API builds its request differently. The SPARQL query (population, point in time, statement rank) is built in `medallion/config.py`.
+- The Lambda fetches every source, so it's renamed `ingest_weather` → **`ingest_sources`**. Raw: `wikidata/population/date=YYYY-MM-DD/<station_id>.json`, the SPARQL response untouched.
+- Bronze: `src/00_bronze/ddl/wikidata_population/v001_create.sql` mirrors the SPARQL JSON (`head`, `results.bindings[]` of `{type, value, datatype}`). **`load_raw_files` doesn't change**: that's the test of config-driven bronze.
+- Silver: `01_silver.populations`, one row per `(station_id, reference_date)` with `population` (people), plus `populations_quarantine`. Rules: missing point in time (undated values happen on Wikidata), a population that isn't a positive whole number, and `DeprecatedRank` statements (Wikidata's way of marking a value wrong). Duplicates for one date: preferred rank first, then the latest ingest.
+- Shared mechanics (split, dedup, reconcile, classify changes, the MERGE statement text) move into a generic `medallion/silver.py`, with the entity rules in `medallion/readings.py` and `medallion/populations.py`. The MERGE still runs in the job scripts.
+- Glue job `clean_populations`; `weather_pipeline` runs the two clean jobs in a `Parallel` state after the loads.
+- Gold (step 4) joins each station-day to the latest `reference_date` on or before that day, and shows population as a column (the user's choice: no alert thresholds).
+
+**Changed while building it (the user's two questions):**
+
+1. *"What if weather is real time and Wikidata is batch: are you sure to mix the logic?"* The first version had one Lambda (`ingest_sources`) looping over every source inside one `weather_pipeline`. That couples sources with nothing in common: a Wikidata outage would fail the weather run, every daily run would re-download population counts that change once a decade, and one timeout and one retry policy would cover two very different APIs. Asked what I'd choose for **30 sources in production**, the answer was neither one pipeline for everything nor 30 hand-written ones, but **metadata-driven** ingestion:
+   - **Code is shared by kind of source.** `build_request` covers `open_meteo_archive` and `wikidata_sparql`. `load_raw_files` and the silver mechanics are generic.
+   - **Runs are isolated by execution.** A single state machine, **`source_pipeline`** (ingest → `load_raw_files` → the source's `silver_job`, which the Lambda returns), is started once per source with `{"source": …}`. Each source succeeds, fails, retries and backfills on its own.
+   - **Config per source:** `silver_job` and `lag_days` (the weather archive publishes about 5 days late, Wikidata is current) in `config/sources.toml`. Schedules are in Terraform (`source_schedules`, EventBridge Scheduler, one per source: weather daily, population monthly), because Terraform can't read TOML. They're deployed **DISABLED**, so nothing runs or bills by accident.
+   - A real-time source (step 6) is a separate streaming path into bronze, not this batch framework.
+2. *Group code by entity instead of by kind of file* (the user's proposal, adopted with two adjustments). The layout goes from `src/<layer>/ddl/<table>/v001_create.sql` and `src/<layer>/glue_job/<process>.py` to:
+   ```
+   src/00_bronze/_ingestion/lambda_ingest_source.py, glue_job_load_raw_files.py   generic: serve every source
+   src/00_bronze/open_meteo_hourly/ddl_open_meteo_hourly_v001_create.sql
+   src/01_silver/readings/ddl_readings_v001_create.sql
+                         /ddl_readings_quarantine_v001_create.sql
+                         /glue_job_clean_readings.py
+   src/ops/schema_migrations/glue_job_apply_ddl.py
+   ```
+   The adjustments: (a) processes that serve many tables (the Lambda, `load_raw_files`) don't belong to one entity, so they live in `_ingestion/` at the layer level; (b) a DDL file name carries its table and version (`ddl_<table>_v<NNN>_<verb>.sql`), because an entity folder holds its main table *and* its quarantine, each with its own versions. The runner enforces that a table lives in its entity's folder (the table is the entity or starts with `<entity>_`). This differs from the sibling repo's one-folder-per-table (its step 12): there the unit is the table, here it's the entity and the process that writes it.
+
+Built:
+- Sources get a `kind`, plus `silver_job` and `lag_days`. Stations get a `wikidata_id` (Q1486, Q44210, Q44254).
+- [`medallion/silver.py`](../src/medallion/silver.py) now holds the generic mechanics: `collect_reasons`, split, `dedup_latest` (with a `prefer` order), `reconcile`, `classify_changes`, `merge_sql`, `quarantine_merge_sql`, `new_rejects`. The entity rules live in [`readings.py`](../src/medallion/readings.py) and [`populations.py`](../src/medallion/populations.py), so the two clean jobs differ only in their entity module and tables. **47 tests.**
+- Migrations: bronze `wikidata_population` (the SPARQL JSON as is: `results.bindings[]` of `{datatype, type, value}`), silver `populations` (`NOT NULL`, `WRITE ORDERED BY station_id, reference_date`) and `populations_quarantine`.
+- Terraform: Lambda `ingest_source`; state machine `source_pipeline` (the Clean step's `JobName` comes from the Lambda's output); two EventBridge Scheduler schedules (disabled) with their own role, allowed only `states:StartExecution`.
+
+Verified (2026-09-27):
+- **The reorganisation re-applied nothing.** `apply_ddl` reported **6 already applied, 0 pending, 6 moved** and refreshed the paths in `ops.schema_migrations`; a second run reported 0 moved. That's what identifying migrations by checksum buys.
+- **`load_raw_files` loaded the new source without a code change**, locally first and then on AWS.
+- **Two sources, two independent executions started together:** `wikidata_population-2026-09-27-a` (load 61 s, clean 68 s) and `open_meteo_hourly-2026-09-23-a` (load 49 s, clean 66 s), both SUCCEEDED and running at the same time.
+- Silver `populations`: 27 dated counts (Buenos Aires 18 back to 1887, Córdoba 2, Ushuaia 7), with the 2022 census preferred: 3,121,707 / 1,505,250 / 82,615. `readings`: 288 rows over 4 days. Locally, a rerun of `clean_populations` changed nothing and committed no snapshot.
+- **The as-of join works in Athena:** for each station-day, `max_by(population, reference_date)` over the counts with `reference_date <= day` gives the 2022 census for 2026-09-23.
+- An unknown source (`nasa_satellites`) fails the execution in seconds: `ValueError` isn't retried.
+
+**Learned:**
+- **Building a Spark `Column` needs an active session.** A module-level `PREFER = (F.desc(...),)` failed at import in tests, and would have failed the same way in the Glue job, which imports modules before creating its session. Column expressions go inside functions.
+- **Wikidata keeps its own data quality metadata:** statement **ranks** (preferred / normal / deprecated) instead of deleting wrong values, and qualifiers such as the point in time. Silver uses both: deprecated statements are rejected, and the preferred one wins a shared date. When a new census arrives, the old one is demoted to normal rank, so `is_preferred_rank` is a tracked value that the MERGE updates.
+- **Step Functions can take a task's resource name from the state data** (`"JobName.$": "$.ingest.silver_job"`), so one state machine drives any source's silver job. IAM must still list every job it may start.
+- **EventBridge Scheduler** (not the older EventBridge rules) has its own `state = DISABLED`, a time zone, and a role for its target. It's available on the Free plan.
+- Terraform has `jsondecode` and `yamldecode` but no TOML decoder, so deployment settings that Terraform needs (schedules) live in Terraform, and source semantics live in the TOML.
+
 ## 4. Gold + data quality
 
-- Glue job `build_reading_metrics` (`src/02_gold/`): `"02_gold".agg_readings_daily` (min/max/avg per station-day) and window functions (rolling 24h average, `LAG` gap detection)
+- Glue job `build_reading_metrics` (`src/02_gold/`): `"02_gold".agg_readings_daily` (min/max/avg per station-day, plus the station's population as of that day from `01_silver.populations`) and window functions (rolling 24h average, `LAG` gap detection)
 - Checks in order compute → check → write, so a failing check fails the Glue job, the state machine catches it, and SNS sends an email
 
 ## 5. Backfill

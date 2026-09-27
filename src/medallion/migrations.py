@@ -1,19 +1,23 @@
-"""Table DDL as write-once SQL migrations, one folder per table, applied by the apply_ddl Glue job.
+"""Table DDL as write-once SQL migrations, kept next to the code of their entity, applied by the apply_ddl Glue job.
 
-Migrations live next to the code of the layer they belong to, one folder per table, named as the table is called now:
+Code is grouped by entity: one folder per entity inside each layer, holding its tables' migrations and the job that
+writes them. A migration is named after its table and version, so one folder can hold an entity's main table and its
+quarantine:
 
-    src/00_bronze/ddl/open_meteo_hourly/v001_create.sql
-                                       /v002_alter.sql
-    src/01_silver/ddl/readings/v001_create.sql
-    src/ops/ddl/<table>/v001_create.sql          tooling tables, applied after the layers
+    src/00_bronze/open_meteo_hourly/ddl_open_meteo_hourly_v001_create.sql
+    src/01_silver/readings/ddl_readings_v001_create.sql
+                          /ddl_readings_v002_alter.sql
+                          /ddl_readings_quarantine_v001_create.sql
+                          /glue_job_clean_readings.py
 
-Terraform owns the Glue databases, so unlike the Databricks sibling repo there is no folder that creates them.
+A table's migrations live in its entity folder: the table is the entity (`readings`) or starts with it
+(`readings_quarantine`). Terraform owns the Glue databases, so no migration creates them.
 
-**A migration is identified by the SHA-256 of its content, not by its path.** Renaming a table moves and renumbers its
-files, and that must not look like a different migration. Editing or deleting an applied migration fails.
+**A migration is identified by the SHA-256 of its content, not by its path.** Reorganising folders or renaming a
+table moves files, and that must not look like a different migration. Editing or deleting an applied migration fails.
 
-The runner (src/ops/glue_job/apply_ddl.py) only executes SQL and records history. Everything that decides *what* runs and in
-which order lives here, free of Spark, so it can be unit-tested.
+The runner (src/ops/schema_migrations/glue_job_apply_ddl.py) only executes SQL and records history. Everything that
+decides *what* runs and in which order lives here, free of Spark, so it can be unit-tested.
 """
 
 import hashlib
@@ -26,8 +30,9 @@ SRC_DIR = Path(__file__).resolve().parents[1]
 
 # A layer folder (00_bronze …) or `ops`, which holds tooling tables and runs last, after the layers it supports.
 LAYER_FOLDER = re.compile(r"^(?:(?P<order>\d{2})_(?P<layer>bronze|silver|gold)|(?P<ops>ops))$")
-TABLE_FOLDER = re.compile(r"^[a-z][a-z0-9_]*$")
-FILE_NAME = re.compile(r"^v(?P<version>\d{3})_(?P<verb>create|alter|rename|drop)\.sql$")
+ENTITY_FOLDER = re.compile(r"^[a-z][a-z0-9_]*$")
+FILE_NAME = re.compile(r"^ddl_(?P<table>[a-z][a-z0-9_]*?)_v(?P<version>\d{3})_(?P<verb>create|alter|rename|drop)\.sql$")
+GLOB = "*/*/ddl_*.sql"
 PLACEHOLDER = re.compile(r"\$\{([a-z_]+)\}")
 # The Spark catalog name and the Glue databases: what differs between the real lakehouse and a throwaway copy.
 PLACEHOLDERS = ("catalog", "bronze_db", "silver_db", "gold_db", "ops_db")
@@ -41,7 +46,7 @@ class Migration:
     key: str  # what the migration versions: "<layer>_<table>", e.g. "bronze_open_meteo_hourly"
     version: int
     verb: str
-    path: str  # relative to src/, e.g. "00_bronze/ddl/open_meteo_hourly/v001_create.sql"
+    path: str  # relative to src/, e.g. "01_silver/readings/ddl_readings_v001_create.sql"
     sql: str
     folder_order: int
 
@@ -60,17 +65,21 @@ def parse_migrations(files: dict[str, str]) -> list[Migration]:
     problems, migrations = [], []
     for path, sql in sorted(files.items()):
         parts = Path(path).parts
-        folder = LAYER_FOLDER.match(parts[0]) if len(parts) == 4 and parts[1] == "ddl" else None
+        folder = LAYER_FOLDER.match(parts[0]) if len(parts) == 3 else None
         if not folder:
-            problems.append(f"{path}: must be src/<NN_layer or ops>/ddl/<table>/<file>, e.g. 00_bronze/ddl/open_meteo_hourly/v001_create.sql")
+            problems.append(f"{path}: must be src/<NN_layer or ops>/<entity>/<file>, e.g. 01_silver/readings/ddl_readings_v001_create.sql")
             continue
-        table = parts[2]
-        if not TABLE_FOLDER.match(table):
-            problems.append(f"{path}: the folder {table!r} must be the table name in lowercase letters, digits and underscores")
+        entity = parts[1]
+        if not ENTITY_FOLDER.match(entity):
+            problems.append(f"{path}: the folder {entity!r} must be an entity name in lowercase letters, digits and underscores")
             continue
-        name = FILE_NAME.match(parts[3])
+        name = FILE_NAME.match(parts[2])
         if not name:
-            problems.append(f"{path}: must be named v<NNN>_<create|alter|rename|drop>.sql")
+            problems.append(f"{path}: must be named ddl_<table>_v<NNN>_<create|alter|rename|drop>.sql")
+            continue
+        table = name["table"]
+        if table != entity and not table.startswith(f"{entity}_"):
+            problems.append(f"{path}: table {table!r} belongs in its own entity folder: the table must be {entity!r} or start with '{entity}_'")
             continue
 
         version, verb = int(name["version"]), name["verb"]
@@ -100,7 +109,7 @@ def parse_migrations(files: dict[str, str]) -> list[Migration]:
 
 def load_migrations(src_dir: Path = SRC_DIR) -> list[Migration]:
     """The migrations in a source tree (tests and CI). The Glue job reads the same files from S3 instead."""
-    return parse_migrations({path.relative_to(src_dir).as_posix(): path.read_text(encoding="utf-8") for path in sorted(src_dir.glob("*/ddl/*/*.sql"))})
+    return parse_migrations({path.relative_to(src_dir).as_posix(): path.read_text(encoding="utf-8") for path in sorted(src_dir.glob(GLOB))})
 
 
 def pending_migrations(migrations: list[Migration], applied: dict[str, tuple[str, int, str]]) -> list[Migration]:
@@ -121,7 +130,7 @@ def pending_migrations(migrations: list[Migration], applied: dict[str, tuple[str
         else:
             problems.append(f"{path} was applied but is gone: no file has its content, and {key} v{version:03d} no longer exists")
     if problems:
-        raise ValueError("migration history doesn't match the ddl/ folders:\n  " + "\n  ".join(problems))
+        raise ValueError("migration history doesn't match the migration files:\n  " + "\n  ".join(problems))
     return [m for m in migrations if m.checksum not in applied]
 
 

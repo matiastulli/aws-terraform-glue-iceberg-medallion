@@ -3,18 +3,8 @@ import datetime as dt
 import pytest
 from pyspark.sql import functions as F
 
-from medallion.silver import (
-    add_observed_at,
-    add_rejection_reasons,
-    change_counts,
-    classify_changes,
-    dedup_latest,
-    flatten_hourly,
-    reconcile,
-    rows_to_merge,
-    split_valid_and_rejected,
-    to_silver,
-)
+from medallion.readings import KEY, MEASURES, add_observed_at, add_rejection_reasons, flatten_hourly, to_silver
+from medallion.silver import change_counts, classify_changes, dedup_latest, reconcile, rows_to_merge, split_valid_and_rejected
 
 BRONZE_SCHEMA = """
     utc_offset_seconds int,
@@ -24,6 +14,10 @@ BRONZE_SCHEMA = """
 """
 UNITS = ("iso8601", "°C", "%", "mm", "km/h")
 INGESTED = dt.datetime(2026, 9, 27, 12, 0)
+
+
+def dedup_latest_(split):
+    return dedup_latest(split[0], KEY)
 
 
 def bronze_row(times, temps, humidity=None, precipitation=None, wind=None, *, station="buenos_aires", offset=0, units=UNITS, batch="run-1", ingested=INGESTED):
@@ -104,7 +98,7 @@ def test_the_most_recently_ingested_duplicate_wins(spark):
     later = bronze_row(["2026-09-20T00:00"], [15.4], batch="run-2", ingested=INGESTED + dt.timedelta(hours=1))
     valid, _ = split_valid_and_rejected(readings(spark, later, earlier))
 
-    unique = dedup_latest(valid).collect()
+    unique = dedup_latest(valid, KEY).collect()
 
     assert [(r.temperature_c, r._batch_id) for r in unique] == [(15.4, "run-2")]
     assert reconcile(2, 2, 0, len(unique))["duplicates_dropped"] == 1
@@ -116,13 +110,13 @@ def test_counts_that_do_not_add_up_fail_the_run():
 
 
 def test_a_rerun_changes_nothing_and_older_data_never_overwrites_newer(spark):
-    current = to_silver(dedup_latest(split_valid_and_rejected(readings(spark, bronze_row(["2026-09-20T00:00", "2026-09-20T01:00"], [15.0, 16.0])))[0]))
+    current = to_silver(dedup_latest_(split_valid_and_rejected(readings(spark, bronze_row(["2026-09-20T00:00", "2026-09-20T01:00"], [15.0, 16.0])))))
 
     def updates(temps, ingested):
-        return to_silver(dedup_latest(split_valid_and_rejected(readings(spark, bronze_row(["2026-09-20T00:00", "2026-09-20T01:00", "2026-09-20T02:00"], temps, ingested=ingested)))[0]))
+        return to_silver(dedup_latest_(split_valid_and_rejected(readings(spark, bronze_row(["2026-09-20T00:00", "2026-09-20T01:00", "2026-09-20T02:00"], temps, ingested=ingested)))))
 
     def counts(temps, ingested):
-        return change_counts(classify_changes(updates(temps, ingested), current))
+        return change_counts(classify_changes(updates(temps, ingested), current, KEY, MEASURES))
 
     assert counts([15.0, 16.0, 17.0], INGESTED) == {"new": 1, "changed": 0, "unchanged": 2}
     assert counts([15.0, 16.5, 17.0], INGESTED + dt.timedelta(hours=1)) == {"new": 1, "changed": 1, "unchanged": 1}
@@ -133,12 +127,12 @@ def test_a_rerun_changes_nothing_and_older_data_never_overwrites_newer(spark):
 def test_only_new_and_changed_rows_reach_the_merge(spark):
     # An unchanged row must not reach the MERGE at all: with copy-on-write, matching it rewrites its data file.
     base = readings(spark, bronze_row(["2026-09-20T00:00", "2026-09-20T01:00"], [15.0, 16.0]))
-    current = to_silver(dedup_latest(split_valid_and_rejected(base)[0]))
+    current = to_silver(dedup_latest_(split_valid_and_rejected(base)))
     rerun = readings(spark, bronze_row(["2026-09-20T00:00", "2026-09-20T01:00", "2026-09-20T02:00"], [15.0, 16.5, 17.0], ingested=INGESTED + dt.timedelta(hours=1)))
-    updates = to_silver(dedup_latest(split_valid_and_rejected(rerun)[0]))
+    updates = to_silver(dedup_latest_(split_valid_and_rejected(rerun)))
 
-    merged = rows_to_merge(classify_changes(updates, current))
+    merged = rows_to_merge(classify_changes(updates, current, KEY, MEASURES))
 
     assert merged.columns == updates.columns
     assert sorted(r.temperature_c for r in merged.collect()) == [16.5, 17.0]
-    assert rows_to_merge(classify_changes(current, current)).count() == 0
+    assert rows_to_merge(classify_changes(current, current, KEY, MEASURES)).count() == 0

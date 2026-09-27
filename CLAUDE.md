@@ -41,12 +41,13 @@ Deploy and run (CD from the laptop; deploy order is `terraform apply` → `apply
 ```sh
 export JAVA_HOME=$(/usr/libexec/java_home -v 17); .venv/bin/pytest          # pure logic on local PySpark (pyproject sets pythonpath=src)
 aws glue start-job-run --job-name apply_ddl --arguments '{"--dry_run":"true"}'   # list pending migrations; without the argument, apply them
-aws stepfunctions start-execution --state-machine-arn <weather_pipeline ARN> --input '{"date":"2026-09-20"}'   # date optional (default: a week ago)
+aws stepfunctions start-execution --state-machine-arn <source_pipeline ARN> --name <source>-<date>-a --input '{"source":"open_meteo_hourly","date":"2026-09-20"}'   # one source per execution; date optional (default: today - lag_days); the name becomes _batch_id
+aws scheduler update-schedule ...                                           # schedules source_pipeline-<source> are deployed DISABLED; enable one on purpose
 aws glue start-job-run --job-name clean_readings --arguments '{"--batch_id":"<execution name>"}'   # re-clean one bronze batch; a rerun must report new: 0, changed: 0
 aws glue get-job-run --job-name load_raw_files --run-id <id>                 # job stdout is in CloudWatch /aws-glue/jobs/output/<run id>
 ```
 
-Layout: `config/sources.toml` (sources + stations; names are derived from it), `src/medallion/` (pure logic, tested), `src/<NN_layer>/` with one subfolder per runtime (`lambda/`, `glue_job/`) plus `ddl/<table>/v<NNN>_<verb>.sql`, `src/ops/glue_job/apply_ddl.py`, `terraform/` (uploads code to the `artifacts` bucket; Glue jobs use Spark catalog `glue_catalog`), `terraform/state_machines/*.asl.json`.
+Layout: `config/sources.toml` (sources + stations; names, silver job and lag are derived from it), `src/medallion/` (pure logic, tested), `src/<NN_layer>/<entity>/` holding the entity's migrations `ddl_<table>_v<NNN>_<verb>.sql` and the job that writes it (`glue_job_<process>.py`, `lambda_<process>.py`), `src/00_bronze/_ingestion/` (generic processes that serve every source), `src/ops/schema_migrations/glue_job_apply_ddl.py`, `terraform/` (uploads code to the `artifacts` bucket; Glue jobs use Spark catalog `glue_catalog`), `terraform/state_machines/*.asl.json`.
 
 Queries go through the `weather-lakehouse` Athena workgroup (enforced result bucket, 1 GiB scan cutoff). **Athena DML needs the numbered databases double-quoted**: `SELECT … FROM "00_bronze".open_meteo_hourly` (unquoted is `MALFORMED_QUERY`). Athena DDL and Spark accept them unquoted; quote them anyway (backticks in DDL and Spark).
 
@@ -59,18 +60,18 @@ Adopted from `~/Code/databricks-pyspark-delta-medallion` and translated to AWS. 
 - Tables: `^[a-z][a-z0-9_]*$` and never the layer in the name. Bronze `<source_system>_<source_table>` (`open_meteo_hourly`), silver plural `<entity>` + `<entity>_quarantine` (`readings`, `readings_quarantine`), gold `fct_<event>` / `dim_<entity>` / `agg_<subject>_<grain>` (`agg_readings_daily`), temporary `_tmp_<process>_<purpose>` (created and dropped within one run, never in DDL).
 - Names are **derived** from config (source system + table), never configured by hand.
 - Columns: bronze keeps source names untouched, silver renames. `_` prefix only for pipeline metadata (`_batch_id`, `_ingested_at`, `_source_file`, `_merged_at`). `<event>_at` timestamps (UTC), `<event>_date` dates, units in names (`temperature_c`, `wind_speed_kmh`, `precipitation_mm`), keys `<entity>_id`, booleans `is_`/`has_`, money `<name>_amount` as `DECIMAL`.
-- Processes are named after what they do (`ingest_weather`, `clean_readings`, `build_reading_metrics`), never after the layer. Code lives in one folder per layer (`src/00_bronze/`, `src/01_silver/`, `src/02_gold/`, `src/ops/`), and inside it one folder per runtime: `lambda/` (Lambda handlers), `glue_job/` (Glue Spark scripts), `ddl/` (migrations). The file is named after the process, which is also the deployed Lambda or Glue job name.
+- Processes are named after what they do (`ingest_source`, `clean_readings`, `build_reading_metrics`), never after the layer. **Code is grouped by entity** (the user's decision, step 3b): `src/<NN_layer>/<entity>/` holds the entity's tables' migrations and the job that writes them, with the kind of file as a prefix: `ddl_<table>_v<NNN>_<verb>.sql`, `glue_job_<process>.py`, `lambda_<process>.py`. The entity folder holds its main table and tables named `<entity>_<suffix>` (its quarantine). Generic processes that serve many tables live in `_<purpose>/` at the layer level (`00_bronze/_ingestion/`). The process name is also the deployed Lambda or Glue job name.
 
 **Tables are code**
 - Jobs never create or redefine tables. They check the table exists and the schema contract (exact column names + types), then append / overwrite / `MERGE`. No schema inference, no `mergeSchema`, no automatic schema evolution.
-- Published tables get versioned migrations: `src/<NN_layer>/ddl/<table>/v<NNN>_<create|alter|rename|drop>.sql`, with placeholders for database and bucket names. Identity is the content checksum; never edit an applied migration, add the next version. History in `ops.schema_migrations`.
+- Published tables get versioned migrations: `src/<NN_layer>/<entity>/ddl_<table>_v<NNN>_<create|alter|rename|drop>.sql`, with placeholders for the catalog and database names. Identity is the content checksum, so moving files is free (apply_ddl refreshes the recorded paths); never edit an applied migration, add the next version. History in `ops.schema_migrations`.
 - `apply_ddl` is a **Glue Spark job** (`spark.sql`), not Athena: Athena can't set `write.merge.mode` / `format-version`, sort order or partition evolution, and tables it creates carry `write.object-storage.path`, which breaks Spark writes on Iceberg 1.10 (verified).
 - Partitioning, sort order and table properties (`format-version`, `write.merge.mode`, …) are set in migrations only. Intermediates (DataFrames, temp views, CTEs, `_tmp_` tables) never get DDL.
 - Terraform owns infrastructure (buckets, databases, IAM, jobs, state machines), never table schemas.
 
 **Code structure**
 - Pure logic lives in `src/medallion/` with pytest tests on local PySpark. Glue and Lambda scripts only read, call it, write, and orchestrate; Iceberg `MERGE`s and table writes stay in the scripts.
-- One workflow per process. Bronze is config-driven (`config/stations.toml`): add a source by adding config, never a new script or job.
+- **One pipeline execution per source.** `source_pipeline` is one generic state machine (ingest → load → the source's `silver_job`), run per source with `{"source": …}` by its own schedule: a failing source never blocks another, and each source retries and backfills on its own. Code is shared by *kind* of source (`build_request`), not copied per source. Add a source by adding config plus its migration, never a new script, job or state machine. Real-time sources (step 6) are a separate streaming path that lands in bronze too.
 - Gold runs compute → data quality checks → write. If a check can only run after a write, roll back to the prior snapshot, and advance a watermark only after the checks pass.
 - Everything that writes is safe to run twice: silver `MERGE`s on `(station_id, observed_at)`, and a rerun inserts 0 rows.
 - Bronze is append-only. Never delete a streaming checkpoint to "clean up": that's a full reprocess.
