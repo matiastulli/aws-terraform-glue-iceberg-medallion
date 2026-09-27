@@ -20,3 +20,8 @@ derby.log
 # Secrets / OS
 .env
 .DS_Store
+
+# Terraform partial backend config (bucket name)
+backend.hcl
+!backend.hcl.example
+tfplan

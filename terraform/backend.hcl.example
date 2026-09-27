@@ -1,0 +1,4 @@
+# Copy to backend.hcl (gitignored), or generate it from the bootstrap stack:
+#   terraform -chdir=bootstrap output -raw backend_hcl > backend.hcl
+bucket = "weather-lakehouse-tfstate-<suffix>"
+region = "us-east-2"

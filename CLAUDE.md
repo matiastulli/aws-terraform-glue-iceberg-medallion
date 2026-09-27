@@ -26,6 +26,18 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 
 A local Iceberg session needs `spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.10.0`, `spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions` (without it there is no `MERGE INTO`), and a catalog (`spark.sql.catalog.local=org.apache.iceberg.spark.SparkCatalog`, `type=hadoop`, a warehouse path).
 
+Infrastructure (Terraform ≥ 1.10). `bootstrap/` is applied once with local state; the main stack keeps its state in S3:
+
+```sh
+terraform -chdir=terraform/bootstrap init && terraform -chdir=terraform/bootstrap apply   # state bucket + budget; needs terraform.tfvars (alert_email)
+terraform -chdir=terraform/bootstrap output -raw backend_hcl > terraform/backend.hcl
+terraform -chdir=terraform init -backend-config=backend.hcl
+terraform -chdir=terraform plan -out=tfplan && terraform -chdir=terraform apply tfplan   # review the plan before applying
+terraform -chdir=terraform fmt -recursive && terraform -chdir=terraform validate
+```
+
+Queries go through the `weather-lakehouse` Athena workgroup (enforced result bucket, 1 GiB scan cutoff).
+
 ## Working agreements
 
 - **Get the delivery path working early** (Terraform apply, Step Functions run, CI) and test only the high-risk logic until the end: the `(station_id, observed_at)` key, dedup, the validation that splits silver from quarantine, and gold data quality checks.

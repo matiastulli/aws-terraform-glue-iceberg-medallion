@@ -2,13 +2,13 @@
 
 How this project is built, one step at a time. Each step lands in its own commits. Later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** step 0 done, step 1 next
+**Status:** steps 0–1 done, step 2 next
 
 | Step | Status | What it delivers |
 |---|---|---|
 | 0. Local environment | ✅ Done | PySpark + Apache Iceberg on the laptop, at Glue 5.1's versions |
-| 1. AWS access + foundations | ⏳ Next | IAM permissions, a budget alarm, and Terraform for S3, Glue databases and an Athena workgroup |
-| 2. Thin end-to-end | | Lambda ingestion → S3 → Glue job → bronze Iceberg, run by Step Functions, with CI on GitHub Actions |
+| 1. AWS access + foundations | ✅ Done | IAM permissions, a budget alarm, and Terraform for S3, Glue databases and an Athena workgroup |
+| 2. Thin end-to-end | ⏳ Next | Lambda ingestion → S3 → Glue job → bronze Iceberg, run by Step Functions, with CI on GitHub Actions |
 | 3. Silver | | Typed, deduplicated hourly readings through an idempotent Iceberg `MERGE`, plus a quarantine table |
 | 4. Gold + data quality | | Daily aggregates with window functions, checks that fail the state machine, and SNS alerts |
 | 5. Backfill | | A Step Functions `Map` state over a date range, safe to rerun |
@@ -68,16 +68,22 @@ Weather-station telemetry for a handful of cities:
 - **Iceberg's default for `MERGE` is copy-on-write.** Correcting one reading wrote an `overwrite` snapshot with 4 added records: the whole day-1 file (3 rows) was rewritten, plus the new day-2 row. Delta on Databricks would have written a deletion vector instead. Iceberg has the same option (`write.merge.mode = merge-on-read`, which writes delete files), and it's a per-table choice between faster writes and faster reads.
 - Metadata tables (`<table>.snapshots`, `.partitions`, `.files`, `.history`) are how you inspect an Iceberg table. They're the equivalent of `DESCRIBE HISTORY` / `DESCRIBE DETAIL`.
 
-## 1. AWS access + foundations
+## 1. AWS access + foundations ✅
 
 **Goal:** a CLI that can create resources, a cost guardrail, and the empty lakehouse, all in Terraform.
 
 - **Permissions:** `AdministratorAccess` is attached to the CLI's IAM user (done in the console, 2026-09-27). A later improvement is short-lived credentials (`aws login` or IAM Identity Center) instead of access keys.
-- A budget with an email alert (for example $10), created before anything else.
-- Terraform (`terraform/`), with state in S3 and native locking (`use_lockfile`, Terraform ≥ 1.10). The state bucket itself is created once by a bootstrap step.
-- S3 buckets: `raw` (landing JSON), `lake` (Iceberg warehouse), `athena-results`. All are private, encrypted, with versioning on the lake.
-- Glue databases `bronze`, `silver`, `gold`. Glue database names can't start with a digit, unlike the Databricks repo's `00_bronze`.
-- An Athena workgroup with enforced settings and a per-query bytes-scanned limit.
+- [`terraform/bootstrap/`](../terraform/bootstrap/) (local state, applied once): the state bucket and a **$20/month budget** ($100 of credits over ~5 months), with emails at 50% and 100% of actual spend and 100% of forecast. The email is in a gitignored `terraform.tfvars`.
+- [`terraform/`](../terraform/) (state in S3 with native locking, `use_lockfile`): buckets `raw`, `lake` and `athena-results` (private, SSE-S3, a random suffix instead of the account ID), Glue databases `bronze`, `silver`, `gold` pointing at `s3://<lake>/<layer>/`, and the Athena workgroup `weather-lakehouse`.
+- The backend is a partial config: `backend.hcl` (gitignored) holds the bucket name and is generated from the bootstrap output.
+
+**Learned:**
+- **Budgets on the Free plan must exclude credits.** Budgets counts cost net of credits by default, and credits cover everything until they run out, so the tracked cost would stay at $0 and never alert. `include_credit = false` tracks gross spend, which is what burns the credits.
+- **S3 native state locking** (Terraform ≥ 1.10, `use_lockfile = true`) writes a `.tflock` object next to the state, so a DynamoDB lock table is no longer needed.
+- **S3 tag values reject commas** (`InvalidTag`). The allowed characters are letters, digits, spaces and `+ - = . _ : / @`. The failure was partial: the bucket without a comma was created, the others weren't, and a re-plan picked up only what was missing.
+- **Lake versioning + Iceberg:** Iceberg already keeps history in snapshots, so when `expire_snapshots` deletes a file, the S3 noncurrent version is only a safety net. A lifecycle rule expires noncurrent versions after 7 days, so they don't silently keep costing storage.
+- **The Athena workgroup enforces its settings** (`enforce_workgroup_configuration`): the result location, SSE-S3, and a 1 GiB bytes-scanned cutoff per query win over whatever the client sends. That's the per-query cost guardrail, since Athena bills per byte scanned.
+- Glue database names can't start with a digit, unlike the Databricks repo's `00_bronze`.
 
 ## 2. Thin end-to-end
 
