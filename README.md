@@ -21,7 +21,7 @@ The smoke test creates an Iceberg table partitioned by `days(observed_at)` in `.
 Terraform in [`terraform/`](terraform/), region `us-east-2`:
 
 - [`terraform/bootstrap/`](terraform/bootstrap/): the S3 bucket for Terraform state and a monthly cost budget with email alerts. Applied once, with local state.
-- [`terraform/`](terraform/): S3 buckets `raw` (landing JSON), `lake` (Iceberg warehouse) and `athena-results`; Glue Data Catalog databases `bronze`, `silver` and `gold`; and an Athena workgroup that enforces the result location and a per-query bytes-scanned limit.
+- [`terraform/`](terraform/): S3 buckets `raw` (landing JSON), `lake` (Iceberg warehouse) and `athena-results`; Glue Data Catalog databases `00_bronze`, `01_silver`, `02_gold` (numbered so they sort in pipeline order) and `ops`; and an Athena workgroup that enforces the result location and a per-query bytes-scanned limit.
 
 ```sh
 cp terraform/bootstrap/terraform.tfvars.example terraform/bootstrap/terraform.tfvars   # set alert_email

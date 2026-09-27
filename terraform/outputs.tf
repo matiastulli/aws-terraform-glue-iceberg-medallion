@@ -3,7 +3,7 @@ output "buckets" {
 }
 
 output "glue_databases" {
-  value = [for d in aws_glue_catalog_database.layer : d.name]
+  value = [for d in aws_glue_catalog_database.this : d.name]
 }
 
 output "athena_workgroup" {
