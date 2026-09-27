@@ -39,6 +39,15 @@ locals {
         "--batch_id" = "manual"
       }
     }
+    clean_readings = {
+      description = "Flatten, validate and MERGE one bronze batch (--batch_id) into 01_silver.readings, rejects to readings_quarantine"
+      arguments = {
+        "--catalog"   = local.catalog
+        "--bronze_db" = aws_glue_catalog_database.this["00_bronze"].name
+        "--silver_db" = aws_glue_catalog_database.this["01_silver"].name
+        "--batch_id"  = "set-per-run"
+      }
+    }
   }
 }
 

@@ -42,6 +42,7 @@ Deploy and run (CD from the laptop; deploy order is `terraform apply` → `apply
 export JAVA_HOME=$(/usr/libexec/java_home -v 17); .venv/bin/pytest          # pure logic on local PySpark (pyproject sets pythonpath=src)
 aws glue start-job-run --job-name apply_ddl --arguments '{"--dry_run":"true"}'   # list pending migrations; without the argument, apply them
 aws stepfunctions start-execution --state-machine-arn <weather_pipeline ARN> --input '{"date":"2026-09-20"}'   # date optional (default: a week ago)
+aws glue start-job-run --job-name clean_readings --arguments '{"--batch_id":"<execution name>"}'   # re-clean one bronze batch; a rerun must report new: 0, changed: 0
 aws glue get-job-run --job-name load_raw_files --run-id <id>                 # job stdout is in CloudWatch /aws-glue/jobs/output/<run id>
 ```
 

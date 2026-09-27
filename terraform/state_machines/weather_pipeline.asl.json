@@ -1,5 +1,5 @@
 {
-  "Comment": "Ingest one day of weather readings into raw, then load each source into its bronze table. Input: {\"date\": \"YYYY-MM-DD\"} (optional).",
+  "Comment": "Ingest one day of weather readings into raw, load each source into bronze, then clean the batch into silver. Input: {\"date\": \"YYYY-MM-DD\"} (optional).",
   "StartAt": "Ingest",
   "States": {
     "Ingest": {
@@ -69,6 +69,33 @@
         }
       },
       "ResultPath": "$.loads",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }],
+      "Next": "CleanReadings"
+    },
+    "CleanReadings": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${clean_job}",
+        "Arguments": {
+          "--batch_id.$": "$$.Execution.Name"
+        }
+      },
+      "ResultSelector": {
+        "job_run_id.$": "$.Id",
+        "state.$": "$.JobRunState",
+        "execution_seconds.$": "$.ExecutionTime"
+      },
+      "ResultPath": "$.clean",
+      "Retry": [
+        {
+          "Comment": "Same pre-run errors as the load. A failed run would be safe to retry here (the MERGE is idempotent), but a failure is usually a bug or a failed check, which a retry only repeats",
+          "ErrorEquals": ["Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException", "Glue.InternalServiceException"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
       "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }],
       "End": true
     },

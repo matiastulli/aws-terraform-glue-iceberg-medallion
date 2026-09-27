@@ -2,15 +2,15 @@
 
 How this project is built, one step at a time. Each step lands in its own commits. Later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–2 done, step 3 next
+**Status:** steps 0–3 done, step 4 next
 
 | Step | Status | What it delivers |
 |---|---|---|
 | 0. Local environment | ✅ Done | PySpark + Apache Iceberg on the laptop, at Glue 5.1's versions |
 | 1. AWS access + foundations | ✅ Done | IAM permissions, a budget alarm, and Terraform for S3, Glue databases and an Athena workgroup |
 | 2. Thin end-to-end | ✅ Done | Lambda ingestion → S3 → Glue job → bronze Iceberg, run by Step Functions, with CI on GitHub Actions |
-| 3. Silver | ⏳ Next | Typed, deduplicated hourly readings through an idempotent Iceberg `MERGE`, plus a quarantine table |
-| 4. Gold + data quality | | Daily aggregates with window functions, checks that fail the state machine, and SNS alerts |
+| 3. Silver | ✅ Done | Typed, deduplicated hourly readings through an idempotent Iceberg `MERGE`, plus a quarantine table |
+| 4. Gold + data quality | ⏳ Next | Daily aggregates with window functions, checks that fail the state machine, and SNS alerts |
 | 5. Backfill | | A Step Functions `Map` state over a date range, safe to rerun |
 | 6. Near real-time | | Simulated live sensors → SQS → Lambda (pyiceberg + pyarrow) → Iceberg, with late and duplicate events (Kinesis isn't available on the Free plan) |
 | 7. Iceberg operations | | Schema evolution, partition evolution, time travel and rollback, compaction and snapshot expiry, measured with Athena bytes scanned |
@@ -164,11 +164,41 @@ Decisions:
 - **For Lambda tasks, Step Functions error names are the Python exception class names** (`ValueError`, `HTTPError`), so `ErrorEquals` can tell retryable errors from bugs.
 - `glue:startJobRun.sync` makes Step Functions wait for the job run and fail the state if the job fails. Glue 5.1 bills per second with a 1-minute minimum, and a 2 × G.1X job costs about $0.015 per minute.
 
-## 3. Silver
+## 3. Silver ✅
 
-- Flatten Open-Meteo's column arrays into one row per station-hour, type them, and validate them (nulls, physical ranges)
-- Glue job `clean_readings` (`src/01_silver/`), added to `weather_pipeline` after the load: flatten `hourly`'s arrays (`posexplode` / `arrays_zip`), rename into the column convention (`temperature_2m` → `temperature_c`, `relative_humidity_2m` → `relative_humidity_pct`, `wind_speed_10m` → `wind_speed_kmh`, `time` → `observed_at` as a UTC timestamp), dedup within the batch, then `MERGE` into `"01_silver".readings` on `(station_id, observed_at)`, with `_merged_at`. Partitioning (`days(observed_at)`) and `write.merge.mode` are set in its `v001_create` migration. A rerun inserts 0 rows.
-- Invalid rows go to `"01_silver".readings_quarantine` with `rejection_reasons`. Rules handle nulls explicitly, and the job asserts that every distinct input row landed in exactly one of the two tables.
+**Goal:** one typed, validated row per station-hour in `"01_silver".readings`, safe to rerun, with rejects kept and explained.
+
+Built:
+- [`src/medallion/silver.py`](../src/medallion/silver.py), all pure DataFrame functions:
+  - `flatten_hourly`: bronze's parallel arrays → one row per hour (`posexplode` on `time`, `F.get` for the others), renamed to the column convention (`temperature_2m` → `temperature_c`, `relative_humidity_2m` → `relative_humidity_pct`, `precipitation` → `precipitation_mm`, `wind_speed_10m` → `wind_speed_kmh`)
+  - `add_observed_at`: the source's local time string minus `utc_offset_seconds` → a UTC timestamp
+  - `add_rejection_reasons`: missing values, physical ranges, unparseable times, arrays of different lengths, and **units that don't match the column name** (compared null-safely)
+  - `dedup_latest`: one row per key, most recently ingested first, with deterministic tie-breaks
+  - `reconcile`: input = valid + rejected, and valid = unique + duplicates, or the job fails before writing
+  - `classify_changes`: new / changed / unchanged against silver
+- Migrations: [`readings`](../src/01_silver/ddl/readings/v001_create.sql) (`NOT NULL` columns, `days(observed_at)`, explicit copy-on-write, `WRITE ORDERED BY station_id, observed_at` as a second statement) and [`readings_quarantine`](../src/01_silver/ddl/readings_quarantine/v001_create.sql) (nullable values, `rejection_reasons`, `observed_at_raw`).
+- Glue job [`clean_readings`](../src/01_silver/glue_job/clean_readings.py): reads the bronze rows of `--batch_id`, checks both contracts, and MERGEs.
+  - **Silver:** a new key is inserted. A matched key is updated only when its values differ *and* the incoming data isn't older (`s._ingested_at >= t._ingested_at`), so a late backfill can't overwrite newer data.
+  - **Quarantine:** a log per batch, merged on `(station_id, observed_at_raw, _batch_id)` with `<=>`, so null keys still match on a rerun.
+- `weather_pipeline` gained a `CleanReadings` step after the loads, with `--batch_id` = the execution name.
+- 38 tests (10 new for silver).
+
+Verified:
+- **Locally first**, running the real job script against a local Iceberg catalog with the real migrations and the raw files from S3, with Glue's argument parser stubbed. That's minutes cheaper per iteration than Glue. Batch 1: 72 new. A rerun: 0 new, 0 changed. Batch 2 (the same data with one null temperature): 71 unchanged and 1 quarantined (`missing_temperature_c`), and a rerun quarantined nothing more. Batch 3 (one revised value): 1 changed, and silver took the new value.
+- **On AWS:**
+  - `apply_ddl` applied the 2 silver migrations; `readings` ran 2 statements.
+  - `clean_readings` for the two existing batches: 72 new each (59 s and 71 s).
+  - `run-2026-09-22-a` ran the full pipeline end to end in 4 minutes (Lambda, load 64 s, clean 78 s): 72 new.
+  - Re-cleaning `run-2026-09-20-a`: **0 new, 0 changed, 72 unchanged, and no new snapshot.** Silver now has 216 rows (3 stations × 72 hours) and 3 snapshots, one per day.
+  - Quarantine is empty: the real data had nothing to reject.
+
+**Learned:**
+- **A copy-on-write `MERGE` rewrites every data file holding a *matched* key, even when the `WHEN MATCHED AND …` condition is false for all of them.** The first version sent every row to the MERGE. A rerun that changed nothing still committed an `overwrite` snapshot rewriting all 72 records (72 added, 72 deleted), and the empty quarantine MERGE committed an empty `append` snapshot. The data was idempotent; the table and the cost weren't. Now only new and changed rows reach the MERGE, and an empty MERGE is skipped, so a rerun commits nothing. The MERGE keeps its own conditions as a safety net.
+- **Copy-on-write means a 1-row update rewrites the whole file** (measured locally: 1 changed reading → 72 deleted + 72 added). Merge-on-read would write a delete file and 1 row instead, and readers would merge them at query time. Silver's MERGE is insert-mostly, so copy-on-write fits; step 7 measures the alternative.
+- **`MERGE … ON a = b` never matches nulls**, so a quarantine rerun would insert the same reject again. Keys that can be null use `<=>` (null-safe equality).
+- **`collect()` returns timestamps as naive datetimes in the machine's local time zone**, not the Spark session's. A test comparing `datetime`s passed on UTC machines and failed in Buenos Aires (20:00 instead of 23:00 UTC). Tests compare `date_format(...)` strings computed in Spark instead.
+- `F.get(array, i)` (Spark 3.4+) is 0-based and returns null past the end, even with ANSI mode on. `element_at` is 1-based and throws under ANSI.
+- The Step Functions `Map` fans out the loads, and silver runs once after all of them, cleaning everything the execution loaded (one `_batch_id`).
 
 ## 4. Gold + data quality
 

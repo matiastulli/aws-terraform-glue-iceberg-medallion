@@ -4,5 +4,6 @@ resource "aws_sfn_state_machine" "weather_pipeline" {
   definition = templatefile("${path.module}/state_machines/weather_pipeline.asl.json", {
     ingest_function = aws_lambda_function.ingest_weather.arn
     load_job        = aws_glue_job.this["load_raw_files"].name
+    clean_job       = aws_glue_job.this["clean_readings"].name
   })
 }

@@ -8,6 +8,7 @@ locals {
   glue_scripts = {
     apply_ddl      = "ops/glue_job/apply_ddl.py"
     load_raw_files = "00_bronze/glue_job/load_raw_files.py"
+    clean_readings = "01_silver/glue_job/clean_readings.py"
   }
 }
 

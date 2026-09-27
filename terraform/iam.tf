@@ -81,7 +81,7 @@ data "aws_iam_policy_document" "step_functions" {
   }
   statement {
     actions   = ["glue:StartJobRun", "glue:GetJobRun", "glue:GetJobRuns", "glue:BatchStopJobRun"]
-    resources = [aws_glue_job.this["load_raw_files"].arn]
+    resources = [aws_glue_job.this["load_raw_files"].arn, aws_glue_job.this["clean_readings"].arn]
   }
 }
 

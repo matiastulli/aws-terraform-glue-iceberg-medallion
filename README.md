@@ -35,8 +35,10 @@ terraform -chdir=terraform init -backend-config=backend.hcl && terraform -chdir=
 ```
 Step Functions weather_pipeline ({"date": "YYYY-MM-DD"})
   ├─ Lambda ingest_weather      Open-Meteo archive API → s3://<raw>/open_meteo/hourly/date=…/<station_id>.json
-  └─ Map over sources
-       └─ Glue load_raw_files   raw JSON → "00_bronze".open_meteo_hourly (Iceberg, append-only)
+  ├─ Map over sources
+  │    └─ Glue load_raw_files   raw JSON → "00_bronze".open_meteo_hourly (Iceberg, append-only)
+  └─ Glue clean_readings        the batch → "01_silver".readings (MERGE on station_id, observed_at)
+                                           + "01_silver".readings_quarantine (rejects with rejection_reasons)
 ```
 
 - Sources and stations are configured in [`config/sources.toml`](config/sources.toml). Table names, raw paths and API requests are derived from it.
@@ -54,4 +56,6 @@ Query in Athena (workgroup `weather-lakehouse`). The numbered databases need dou
 
 ```sql
 SELECT station_id, cardinality(hourly.time) AS hours FROM "00_bronze".open_meteo_hourly;
+SELECT station_id, observed_at, temperature_c FROM "01_silver".readings ORDER BY observed_at DESC LIMIT 10;
+SELECT * FROM "01_silver"."readings$snapshots";   -- Iceberg metadata table: one snapshot per commit
 ```
