@@ -25,3 +25,6 @@ derby.log
 backend.hcl
 !backend.hcl.example
 tfplan
+
+# Terraform build output (zips for Lambda and Glue)
+.build/

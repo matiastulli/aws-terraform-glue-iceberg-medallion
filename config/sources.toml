@@ -1,0 +1,28 @@
+# Bronze sources and the weather stations they are read for.
+# Everything downstream is derived from here: the bronze table is <system>_<table> (open_meteo_hourly), raw files land in
+# s3://<raw>/<system>/<table>/date=YYYY-MM-DD/<station_id>.json, and adding a source is a config entry plus its migration.
+# For Open-Meteo, `table` is both the API parameter that lists the variables and the response block that holds them.
+
+[[sources]]
+system = "open_meteo"
+table = "hourly"
+api_url = "https://archive-api.open-meteo.com/v1/archive"
+variables = ["temperature_2m", "relative_humidity_2m", "precipitation", "wind_speed_10m"]
+
+[[stations]]
+station_id = "buenos_aires"
+name = "Buenos Aires"
+latitude = -34.61
+longitude = -58.38
+
+[[stations]]
+station_id = "cordoba"
+name = "Córdoba"
+latitude = -31.42
+longitude = -64.18
+
+[[stations]]
+station_id = "ushuaia"
+name = "Ushuaia"
+latitude = -54.80
+longitude = -68.30

@@ -36,6 +36,17 @@ terraform -chdir=terraform plan -out=tfplan && terraform -chdir=terraform apply 
 terraform -chdir=terraform fmt -recursive && terraform -chdir=terraform validate
 ```
 
+Deploy and run (CD from the laptop; deploy order is `terraform apply` → `apply_ddl` → pipeline):
+
+```sh
+export JAVA_HOME=$(/usr/libexec/java_home -v 17); .venv/bin/pytest          # pure logic on local PySpark (pyproject sets pythonpath=src)
+aws glue start-job-run --job-name apply_ddl --arguments '{"--dry_run":"true"}'   # list pending migrations; without the argument, apply them
+aws stepfunctions start-execution --state-machine-arn <weather_pipeline ARN> --input '{"date":"2026-09-20"}'   # date optional (default: a week ago)
+aws glue get-job-run --job-name load_raw_files --run-id <id>                 # job stdout is in CloudWatch /aws-glue/jobs/output/<run id>
+```
+
+Layout: `config/sources.toml` (sources + stations; names are derived from it), `src/medallion/` (pure logic, tested), `src/<NN_layer>/` (Glue and Lambda entry points plus `ddl/<table>/v<NNN>_<verb>.sql`), `src/ops/apply_ddl.py`, `terraform/` (uploads code to the `artifacts` bucket; Glue jobs use Spark catalog `glue_catalog`), `terraform/state_machines/*.asl.json`.
+
 Queries go through the `weather-lakehouse` Athena workgroup (enforced result bucket, 1 GiB scan cutoff). **Athena DML needs the numbered databases double-quoted**: `SELECT … FROM "00_bronze".open_meteo_hourly` (unquoted is `MALFORMED_QUERY`). Athena DDL and Spark accept them unquoted; quote them anyway (backticks in DDL and Spark).
 
 ## Conventions

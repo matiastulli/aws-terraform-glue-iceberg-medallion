@@ -9,6 +9,7 @@ locals {
     raw            = "landing zone: raw JSON from Open-Meteo as received"
     lake           = "Iceberg warehouse: data and metadata files for bronze silver and gold"
     athena-results = "Athena query results"
+    artifacts      = "deployed code: Glue job scripts and the medallion package and DDL migrations and config"
   }
 }
 

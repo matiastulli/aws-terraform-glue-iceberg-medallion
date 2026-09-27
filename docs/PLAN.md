@@ -2,14 +2,14 @@
 
 How this project is built, one step at a time. Each step lands in its own commits. Later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–1 done, step 2 next
+**Status:** steps 0–2 done, step 3 next
 
 | Step | Status | What it delivers |
 |---|---|---|
 | 0. Local environment | ✅ Done | PySpark + Apache Iceberg on the laptop, at Glue 5.1's versions |
 | 1. AWS access + foundations | ✅ Done | IAM permissions, a budget alarm, and Terraform for S3, Glue databases and an Athena workgroup |
-| 2. Thin end-to-end | ⏳ Next | Lambda ingestion → S3 → Glue job → bronze Iceberg, run by Step Functions, with CI on GitHub Actions |
-| 3. Silver | | Typed, deduplicated hourly readings through an idempotent Iceberg `MERGE`, plus a quarantine table |
+| 2. Thin end-to-end | ✅ Done | Lambda ingestion → S3 → Glue job → bronze Iceberg, run by Step Functions, with CI on GitHub Actions |
+| 3. Silver | ⏳ Next | Typed, deduplicated hourly readings through an idempotent Iceberg `MERGE`, plus a quarantine table |
 | 4. Gold + data quality | | Daily aggregates with window functions, checks that fail the state machine, and SNS alerts |
 | 5. Backfill | | A Step Functions `Map` state over a date range, safe to rerun |
 | 6. Near real-time | | Simulated live sensors → SQS → Lambda (pyiceberg + pyarrow) → Iceberg, with late and duplicate events (Kinesis isn't available on the Free plan) |
@@ -124,23 +124,42 @@ Adopted on 2026-09-27, before any table exists, from the sibling repo's [CLAUDE.
 - **The Athena workgroup enforces its settings** (`enforce_workgroup_configuration`): the result location, SSE-S3, and a 1 GiB bytes-scanned cutoff per query win over whatever the client sends. That's the per-query cost guardrail, since Athena bills per byte scanned.
 - A leading digit in a database name works in Glue, Athena and Spark, but Athena DML needs it double-quoted (see Conventions). The databases were first created as `bronze`/`silver`/`gold` on an untested claim that digits aren't allowed, then replaced while they were still empty.
 
-## 2. Thin end-to-end
+## 2. Thin end-to-end ✅
 
 **Goal:** one real run through every piece of the delivery path before any feature work.
 
-- `config/stations.toml`: the source (`open_meteo` + `hourly`, from which the bronze table name `open_meteo_hourly` is derived) and a few stations (`station_id`, name, latitude, longitude)
-- `src/medallion/`: the first pure functions (config parsing and name derivation, ingestion metadata, the schema contract) with tests on local PySpark
-- **Tables are code from the first table:** the migration runner logic in `src/medallion/migrations.py` (tested: run order, pending only, checksum drift, misnamed or misplaced files), the `apply_ddl` Glue Spark job in `src/ops/` with `dry_run`, and `src/00_bronze/ddl/open_meteo_hourly/v001_create.sql`. The runner creates `ops.schema_migrations` itself.
-- Lambda `ingest_weather`: calls Open-Meteo for a date and writes raw JSON to `s3://<raw>/open_meteo/date=YYYY-MM-DD/<station_id>.json`
-- Glue job `load_open_meteo` (`src/00_bronze/`): reads the raw JSON, adds `_batch_id`, `_ingested_at`, `_source_file`, checks the table exists and matches its contract, and appends to `"00_bronze".open_meteo_hourly`
-- Step Functions `weather_pipeline`: ingest → load, with retries and a catch. Deploy order: `terraform apply` → `apply_ddl` → pipeline.
-- Verify what Iceberg itself enforces on a `_tmp_` table (extra column, missing nullable column, castable type, null into a required column) to decide what the contract check must catch. Delta accepted a missing nullable column in the sibling repo.
-- GitHub Actions: pytest + `terraform fmt -check` + `terraform validate`
+Built:
+- [`config/sources.toml`](../config/sources.toml) (renamed from the planned `stations.toml`, since it holds the sources too): the source `open_meteo` + `hourly` and three stations. Everything is derived from `system` + `table`: the bronze table `open_meteo_hourly`, the raw prefix `open_meteo/hourly/date=YYYY-MM-DD/`, and the API request (for Open-Meteo, `table` is both the request parameter listing the variables and the response block holding them). So a `daily` source would be config plus a migration, with no new code.
+- [`src/medallion/`](../src/medallion/): `config.py` (parsing, validation, derived names; no pyspark, because the Lambda imports it), `bronze.py` (read schema = table schema minus the added columns; `station_id` from the file name, and a misnamed file fails the load), `contract.py`, and `migrations.py` (ported from the sibling repo without its `catalog/` folder, because Terraform owns the databases here). **28 tests**, all on the high-risk logic.
+- Migrations: [`src/00_bronze/ddl/open_meteo_hourly/v001_create.sql`](../src/00_bronze/ddl/open_meteo_hourly/v001_create.sql). Bronze mirrors the API response: one row per station-day, with the `hourly` block of parallel arrays kept as a struct (silver flattens it), plus `station_id` and `_batch_id`, `_ingested_at`, `_source_file`. It's partitioned by `days(_ingested_at)`, with `format-version` 2 and zstd.
+- Glue job [`apply_ddl`](../src/ops/apply_ddl.py): reads the migrations from `s3://<artifacts>/ddl/`, and creates `ops.schema_migrations` itself.
+- Lambda [`ingest_weather`](../src/00_bronze/ingest_weather.py): writes each API response untouched to the raw bucket. Rewriting the same key makes reruns safe.
+- Glue job [`load_raw_files`](../src/00_bronze/load_raw_files.py): generic over sources (`--source`, `--date`, `--batch_id`). It fails if the table is missing, reads the JSON with the table's schema (`FAILFAST`), checks the contract, and appends.
+- Step Functions `weather_pipeline` ([ASL](../terraform/state_machines/weather_pipeline.asl.json)): Ingest → `Map` over the sources the Lambda returns → `glue:startJobRun.sync`, with a catch to a `Fail` state. `_batch_id` is the execution name.
+- Terraform: an `artifacts` bucket (scripts, the zipped `medallion` package, DDL, config, each uploaded with a content-hash `etag`), three IAM roles (Glue, Lambda, Step Functions), the two Glue 5.1 jobs (2 × G.1X, `max_retries = 0` because Step Functions owns retries), the Lambda (Python 3.11) with 14-day logs, and the state machine.
+- [GitHub Actions](../.github/workflows/ci.yml): pytest, plus `terraform fmt -check` and `validate` with `-backend=false` (no credentials).
+
+Verified on the account (2026-09-27):
+- `apply_ddl --dry_run true`: 1 pending, nothing executed. The real run applied `v001_create`, and a rerun reported **1 already applied, 0 pending**. Glue runs took 38–53 s.
+- The run `run-2026-09-20-a` (date 2026-09-20) **succeeded end to end in 2 minutes**: 3 raw files, then `load_raw_files` in 79 s, then **3 rows** in bronze (snapshot `1420641045076479683`), each with 24 hours. Athena read them back through `"00_bronze".open_meteo_hourly` and `"ops".schema_migrations`.
+- Failure path: a bad date fails the Lambda with `ValueError`, and the catch ends in `WeatherPipelineFailed`.
+
+Decisions:
+- **Retries only where they're safe and useful.** The Ingest task retries only transient errors (Lambda service errors, `HTTPError`, `URLError`, `TimeoutError`). The first version retried `States.ALL`, and the bad-date test showed a deterministic `ValueError` being retried 3 times (4 attempts, ~35 s) before failing; now it fails at once (0.1 s). The Glue load retries only errors raised before the job runs (concurrency, throttling), never a failed job: bronze appends, so a retry after a commit would load the batch twice.
+- **A bronze rerun appends the same files under a new `_batch_id`.** That's by design (bronze is append-only, and silver's `MERGE` on the key absorbs repeats), not something to fix with deletes.
+- `station_id` has no `_` prefix: it isn't pipeline metadata, it's the entity key, taken from the file name because the API response doesn't carry it.
+
+**Learned:**
+- **What Iceberg enforces on its own** (Spark 3.5.6 + Iceberg 1.10.0, `writeTo().append()`, tested on a `_tmp_` table): it **rejects** an extra column, a **missing nullable column** (Delta accepts that one and fills in nulls), string → int, an overflowing bigint → int, and null into `NOT NULL`. It **silently accepts** double `50.7` → int stored as `50` (truncated), double `1.555` → `DECIMAL(10,2)` stored as `1.56` (rounded), and float `1.1` → double stored as `1.100000023841858`. It matches columns **by name**, so order doesn't matter. That's why `contract.py` still compares exact types before every write.
+- **Glue takes one `--conf` key**, so the Iceberg catalog settings ride inside its value: `spark.sql.extensions=… --conf spark.sql.catalog.glue_catalog=… --conf …`. With `--datalake-formats iceberg`, Glue adds the jars. A plain `SparkSession.builder.getOrCreate()` works in the script; `GlueContext` is only needed for Glue features such as bookmarks and DynamicFrames.
+- **The Iceberg `GlueCatalog` puts a table under its database's `LocationUri`** (`s3://<lake>/00_bronze/open_meteo_hourly`), so migrations need no bucket placeholder, only the catalog and database names. Tables created by Spark don't get Athena's `write.object-storage.*` properties.
+- **For Lambda tasks, Step Functions error names are the Python exception class names** (`ValueError`, `HTTPError`), so `ErrorEquals` can tell retryable errors from bugs.
+- `glue:startJobRun.sync` makes Step Functions wait for the job run and fail the state if the job fails. Glue 5.1 bills per second with a 1-minute minimum, and a 2 × G.1X job costs about $0.015 per minute.
 
 ## 3. Silver
 
 - Flatten Open-Meteo's column arrays into one row per station-hour, type them, and validate them (nulls, physical ranges)
-- Glue job `clean_readings` (`src/01_silver/`): dedup within the batch, then `MERGE` into `"01_silver".readings` on `(station_id, observed_at)`, with `_merged_at`. Partitioning (`days(observed_at)`) and `write.merge.mode` are set in its `v001_create` migration. A rerun inserts 0 rows.
+- Glue job `clean_readings` (`src/01_silver/`), added to `weather_pipeline` after the load: flatten `hourly`'s arrays (`posexplode` / `arrays_zip`), rename into the column convention (`temperature_2m` → `temperature_c`, `relative_humidity_2m` → `relative_humidity_pct`, `wind_speed_10m` → `wind_speed_kmh`, `time` → `observed_at` as a UTC timestamp), dedup within the batch, then `MERGE` into `"01_silver".readings` on `(station_id, observed_at)`, with `_merged_at`. Partitioning (`days(observed_at)`) and `write.merge.mode` are set in its `v001_create` migration. A rerun inserts 0 rows.
 - Invalid rows go to `"01_silver".readings_quarantine` with `rejection_reasons`. Rules handle nulls explicitly, and the job asserts that every distinct input row landed in exactly one of the two tables.
 
 ## 4. Gold + data quality
