@@ -12,7 +12,7 @@ Terraform owns the Glue databases, so unlike the Databricks sibling repo there i
 **A migration is identified by the SHA-256 of its content, not by its path.** Renaming a table moves and renumbers its
 files, and that must not look like a different migration. Editing or deleting an applied migration fails.
 
-The runner (src/ops/apply_ddl.py) only executes SQL and records history. Everything that decides *what* runs and in
+The runner (src/ops/glue_job/apply_ddl.py) only executes SQL and records history. Everything that decides *what* runs and in
 which order lives here, free of Spark, so it can be unit-tested.
 """
 

@@ -6,8 +6,8 @@ locals {
   medallion_py = fileset("${local.src}/medallion", "*.py")
   ddl_files    = fileset(local.src, "*/ddl/*/*.sql")
   glue_scripts = {
-    apply_ddl      = "ops/apply_ddl.py"
-    load_raw_files = "00_bronze/load_raw_files.py"
+    apply_ddl      = "ops/glue_job/apply_ddl.py"
+    load_raw_files = "00_bronze/glue_job/load_raw_files.py"
   }
 }
 

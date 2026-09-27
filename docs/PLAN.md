@@ -132,11 +132,19 @@ Built:
 - [`config/sources.toml`](../config/sources.toml) (renamed from the planned `stations.toml`, since it holds the sources too): the source `open_meteo` + `hourly` and three stations. Everything is derived from `system` + `table`: the bronze table `open_meteo_hourly`, the raw prefix `open_meteo/hourly/date=YYYY-MM-DD/`, and the API request (for Open-Meteo, `table` is both the request parameter listing the variables and the response block holding them). So a `daily` source would be config plus a migration, with no new code.
 - [`src/medallion/`](../src/medallion/): `config.py` (parsing, validation, derived names; no pyspark, because the Lambda imports it), `bronze.py` (read schema = table schema minus the added columns; `station_id` from the file name, and a misnamed file fails the load), `contract.py`, and `migrations.py` (ported from the sibling repo without its `catalog/` folder, because Terraform owns the databases here). **28 tests**, all on the high-risk logic.
 - Migrations: [`src/00_bronze/ddl/open_meteo_hourly/v001_create.sql`](../src/00_bronze/ddl/open_meteo_hourly/v001_create.sql). Bronze mirrors the API response: one row per station-day, with the `hourly` block of parallel arrays kept as a struct (silver flattens it), plus `station_id` and `_batch_id`, `_ingested_at`, `_source_file`. It's partitioned by `days(_ingested_at)`, with `format-version` 2 and zstd.
-- Glue job [`apply_ddl`](../src/ops/apply_ddl.py): reads the migrations from `s3://<artifacts>/ddl/`, and creates `ops.schema_migrations` itself.
-- Lambda [`ingest_weather`](../src/00_bronze/ingest_weather.py): writes each API response untouched to the raw bucket. Rewriting the same key makes reruns safe.
-- Glue job [`load_raw_files`](../src/00_bronze/load_raw_files.py): generic over sources (`--source`, `--date`, `--batch_id`). It fails if the table is missing, reads the JSON with the table's schema (`FAILFAST`), checks the contract, and appends.
+- Glue job [`apply_ddl`](../src/ops/glue_job/apply_ddl.py): reads the migrations from `s3://<artifacts>/ddl/`, and creates `ops.schema_migrations` itself.
+- Lambda [`ingest_weather`](../src/00_bronze/lambda/ingest_weather.py): writes each API response untouched to the raw bucket. Rewriting the same key makes reruns safe.
+- Glue job [`load_raw_files`](../src/00_bronze/glue_job/load_raw_files.py): generic over sources (`--source`, `--date`, `--batch_id`). It fails if the table is missing, reads the JSON with the table's schema (`FAILFAST`), checks the contract, and appends.
 - Step Functions `weather_pipeline` ([ASL](../terraform/state_machines/weather_pipeline.asl.json)): Ingest → `Map` over the sources the Lambda returns → `glue:startJobRun.sync`, with a catch to a `Fail` state. `_batch_id` is the execution name.
 - Terraform: an `artifacts` bucket (scripts, the zipped `medallion` package, DDL, config, each uploaded with a content-hash `etag`), three IAM roles (Glue, Lambda, Step Functions), the two Glue 5.1 jobs (2 × G.1X, `max_retries = 0` because Step Functions owns retries), the Lambda (Python 3.11) with 14-day logs, and the state machine.
+- **Layout by runtime** (the user's request, for readability): each layer folder has one subfolder per place the code runs, so the folder tells you where a file executes:
+  ```
+  src/00_bronze/lambda/ingest_weather.py        Lambda handler
+  src/00_bronze/glue_job/load_raw_files.py      Glue Spark script
+  src/00_bronze/ddl/open_meteo_hourly/v001_create.sql
+  src/ops/glue_job/apply_ddl.py
+  src/medallion/                                shared pure logic, imported by both runtimes
+  ```
 - [GitHub Actions](../.github/workflows/ci.yml): pytest, plus `terraform fmt -check` and `validate` with `-backend=false` (no credentials).
 
 Verified on the account (2026-09-27):

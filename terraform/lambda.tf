@@ -3,7 +3,7 @@ data "archive_file" "ingest_weather" {
   output_path = "${path.module}/.build/ingest_weather.zip"
 
   source {
-    content  = file("${local.src}/00_bronze/ingest_weather.py")
+    content  = file("${local.src}/00_bronze/lambda/ingest_weather.py")
     filename = "ingest_weather.py"
   }
   source {

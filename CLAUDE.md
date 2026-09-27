@@ -45,7 +45,7 @@ aws stepfunctions start-execution --state-machine-arn <weather_pipeline ARN> --i
 aws glue get-job-run --job-name load_raw_files --run-id <id>                 # job stdout is in CloudWatch /aws-glue/jobs/output/<run id>
 ```
 
-Layout: `config/sources.toml` (sources + stations; names are derived from it), `src/medallion/` (pure logic, tested), `src/<NN_layer>/` (Glue and Lambda entry points plus `ddl/<table>/v<NNN>_<verb>.sql`), `src/ops/apply_ddl.py`, `terraform/` (uploads code to the `artifacts` bucket; Glue jobs use Spark catalog `glue_catalog`), `terraform/state_machines/*.asl.json`.
+Layout: `config/sources.toml` (sources + stations; names are derived from it), `src/medallion/` (pure logic, tested), `src/<NN_layer>/` with one subfolder per runtime (`lambda/`, `glue_job/`) plus `ddl/<table>/v<NNN>_<verb>.sql`, `src/ops/glue_job/apply_ddl.py`, `terraform/` (uploads code to the `artifacts` bucket; Glue jobs use Spark catalog `glue_catalog`), `terraform/state_machines/*.asl.json`.
 
 Queries go through the `weather-lakehouse` Athena workgroup (enforced result bucket, 1 GiB scan cutoff). **Athena DML needs the numbered databases double-quoted**: `SELECT … FROM "00_bronze".open_meteo_hourly` (unquoted is `MALFORMED_QUERY`). Athena DDL and Spark accept them unquoted; quote them anyway (backticks in DDL and Spark).
 
@@ -58,7 +58,7 @@ Adopted from `~/Code/databricks-pyspark-delta-medallion` and translated to AWS. 
 - Tables: `^[a-z][a-z0-9_]*$` and never the layer in the name. Bronze `<source_system>_<source_table>` (`open_meteo_hourly`), silver plural `<entity>` + `<entity>_quarantine` (`readings`, `readings_quarantine`), gold `fct_<event>` / `dim_<entity>` / `agg_<subject>_<grain>` (`agg_readings_daily`), temporary `_tmp_<process>_<purpose>` (created and dropped within one run, never in DDL).
 - Names are **derived** from config (source system + table), never configured by hand.
 - Columns: bronze keeps source names untouched, silver renames. `_` prefix only for pipeline metadata (`_batch_id`, `_ingested_at`, `_source_file`, `_merged_at`). `<event>_at` timestamps (UTC), `<event>_date` dates, units in names (`temperature_c`, `wind_speed_kmh`, `precipitation_mm`), keys `<entity>_id`, booleans `is_`/`has_`, money `<name>_amount` as `DECIMAL`.
-- Processes are named after what they do (`ingest_weather`, `clean_readings`, `build_reading_metrics`), never after the layer. Code lives in one folder per layer: `src/00_bronze/`, `src/01_silver/`, `src/02_gold/`, `src/ops/`.
+- Processes are named after what they do (`ingest_weather`, `clean_readings`, `build_reading_metrics`), never after the layer. Code lives in one folder per layer (`src/00_bronze/`, `src/01_silver/`, `src/02_gold/`, `src/ops/`), and inside it one folder per runtime: `lambda/` (Lambda handlers), `glue_job/` (Glue Spark scripts), `ddl/` (migrations). The file is named after the process, which is also the deployed Lambda or Glue job name.
 
 **Tables are code**
 - Jobs never create or redefine tables. They check the table exists and the schema contract (exact column names + types), then append / overwrite / `MERGE`. No schema inference, no `mergeSchema`, no automatic schema evolution.
