@@ -19,13 +19,30 @@
       "Retry": [
         {
           "Comment": "Only transient errors: rewriting the same raw keys is idempotent. A bad input (ValueError, KeyError) fails at once instead of being retried",
-          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException", "HTTPError", "URLError", "TimeoutError", "States.Timeout"],
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "HTTPError",
+            "URLError",
+            "TimeoutError",
+            "States.Timeout"
+          ],
           "IntervalSeconds": 5,
           "MaxAttempts": 3,
           "BackoffRate": 2
         }
       ],
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
       "Next": "LoadRawFiles"
     },
     "LoadRawFiles": {
@@ -47,13 +64,25 @@
       "Retry": [
         {
           "Comment": "Only errors from before the job ran. A failed job isn't retried: bronze appends, so a retry after a commit would load the batch twice",
-          "ErrorEquals": ["Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException", "Glue.InternalServiceException"],
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException",
+            "Glue.ThrottlingException",
+            "Glue.InternalServiceException"
+          ],
           "IntervalSeconds": 30,
           "MaxAttempts": 3,
           "BackoffRate": 2
         }
       ],
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
       "Next": "Clean"
     },
     "Clean": {
@@ -74,19 +103,41 @@
       "Retry": [
         {
           "Comment": "Same pre-run errors. A failed run would be safe to retry (the MERGE is idempotent), but a failure is usually a bug or a failed check, which a retry only repeats",
-          "ErrorEquals": ["Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException", "Glue.InternalServiceException"],
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException",
+            "Glue.ThrottlingException",
+            "Glue.InternalServiceException"
+          ],
           "IntervalSeconds": 30,
           "MaxAttempts": 3,
           "BackoffRate": 2
         }
       ],
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
       "End": true
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${alerts_topic}",
+        "Subject": "weather-lakehouse: source_pipeline failed",
+        "Message.$": "States.Format('Execution {} failed. Input: {} -- Error: {} -- Cause: {}', $$.Execution.Name, States.JsonToString($$.Execution.Input), $.error.Error, $.error.Cause)"
+      },
+      "ResultPath": null,
+      "Next": "Failed"
     },
     "Failed": {
       "Type": "Fail",
-      "Error": "SourcePipelineFailed",
-      "Comment": "Step 4 adds an SNS alert here"
+      "Error": "SourcePipelineFailed"
     }
   }
 }

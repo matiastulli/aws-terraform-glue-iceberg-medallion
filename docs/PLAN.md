@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits. Later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–3b done, step 4 next
+**Status:** steps 0–4 done, step 5 next
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -11,8 +11,8 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 2. Thin end-to-end | ✅ Done | Lambda ingestion → S3 → Glue job → bronze Iceberg, run by Step Functions, with CI on GitHub Actions |
 | 3. Silver | ✅ Done | Typed, deduplicated hourly readings through an idempotent Iceberg `MERGE`, plus a quarantine table |
 | 3b. Second source: population | ✅ Done | City population from Wikidata through the same stack, so gold can show how many people the weather affects |
-| 4. Gold + data quality | ⏳ Next | Daily aggregates with window functions, checks that fail the state machine, and SNS alerts |
-| 5. Backfill | | A Step Functions `Map` state over a date range, safe to rerun |
+| 4. Gold + data quality | ✅ Done | Daily aggregates with window functions, checks that fail the state machine, and SNS alerts |
+| 5. Backfill | ⏳ Next | A Step Functions `Map` state over a date range, safe to rerun |
 | 6. Near real-time | | Simulated live sensors → SQS → Lambda (pyiceberg + pyarrow) → Iceberg, with late and duplicate events (Kinesis isn't available on the Free plan) |
 | 7. Iceberg operations | | Schema evolution, partition evolution, time travel and rollback, compaction and snapshot expiry, measured with Athena bytes scanned |
 | 8. Governance | | Lake Formation permissions, LF-tags, a column/row filter, and CloudTrail audit |
@@ -262,10 +262,48 @@ Verified (2026-09-27):
 - **EventBridge Scheduler** (not the older EventBridge rules) has its own `state = DISABLED`, a time zone, and a role for its target. It's available on the Free plan.
 - Terraform has `jsondecode` and `yamldecode` but no TOML decoder, so deployment settings that Terraform needs (schedules) live in Terraform, and source semantics live in the TOML.
 
-## 4. Gold + data quality
+## 4. Gold + data quality ✅
 
-- Glue job `build_reading_metrics` (`src/02_gold/`): `"02_gold".agg_readings_daily` (min/max/avg per station-day, plus the station's population as of that day from `01_silver.populations`) and window functions (rolling 24h average, `LAG` gap detection)
-- Checks in order compute → check → write, so a failing check fails the Glue job, the state machine catches it, and SNS sends an email
+**Goal:** a published daily table that answers "what was the weather, and how many people lived there", which is never published when it's wrong.
+
+Built:
+- [`medallion/gold.py`](../src/medallion/gold.py):
+  - `daily_readings`: min/max/avg temperature, humidity, total rain, max wind, `hours_observed`, `is_complete_day`
+  - `add_trends`: `temperature_avg_7d_c` over a **range of calendar days** (`rangeBetween(-6, 0)` on `unix_date`), and `temperature_change_c` via `LAG`, null when the previous calendar day is missing
+  - `with_population`: the **as-of join**, the latest count with `reference_date <= reading_date`, picked with `row_number`
+  - `differs_from`: compares the rebuild with the published table, ignoring `_built_at`
+- [`medallion/quality.py`](../src/medallion/quality.py): 8 checks in one aggregation pass, each reported by name with its numbers:
+  - `not_empty`, `unique_key`, `required_not_null`, `hours_in_range`, `temperature_order`
+  - `population_found` (every station-day has a count on or before it)
+  - `hours_reconcile` (gold's hours = silver's readings)
+  - `precipitation_reconciles`
+- Migration [`ddl_agg_readings_daily_v001_create.sql`](../src/02_gold/agg_readings_daily/ddl_agg_readings_daily_v001_create.sql): `NOT NULL` wherever a value always exists, `WRITE ORDERED BY station_id, reading_date`.
+- Glue job [`build_reading_metrics`](../src/02_gold/agg_readings_daily/glue_job_build_reading_metrics.py): **compute → checks → contract → write**. It rebuilds in full (the 7-day window needs earlier days anyway) with `overwrite(lit(True))`, and **skips the write when nothing changed**. `max_concurrent_runs = 1`.
+- **Event-driven gold:**
+  - an EventBridge rule on `Step Functions Execution Status Change` (status `SUCCEEDED`, `source_pipeline`) starts **`gold_pipeline`** with `{"triggered_by": <execution>}`
+  - two sources finishing together start two rebuilds; the second fails with `ConcurrentRunsExceededException` and is retried with backoff
+  - gold never waits on a source: it rebuilds from whatever silver has
+- **Alerts:** SNS topic `weather-lakehouse-alerts` with an email subscription (the address is in the gitignored `terraform/terraform.tfvars`). A `NotifyFailure` task (`sns:publish`, with the execution name, error and cause) runs before `Fail` in both state machines.
+- 55 tests (8 new for gold and the checks).
+
+Verified:
+- **Locally** (the real job against a local Iceberg catalog):
+  - the first build published
+  - a rerun printed `published: false`, with still 1 snapshot
+  - a silver without populations raised `DataQualityError: population_found: 3 station-days…`, and gold kept its previous version
+- **On AWS:**
+  - `open_meteo_hourly-2026-09-24-a` succeeded, and EventBridge started `gold_pipeline` **0.5 s later** (`"triggered_by": "open_meteo_hourly-2026-09-24-a"`). The build took 75 s: **15 rows** (3 stations × 5 days), all 24-hour days, population from the 2022 census.
+  - A manual rerun of `gold_pipeline`: `published: false`, and `agg_readings_daily$snapshots` still has 1 row.
+  - A data quality failure, against throwaway `zz_silver` / `zz_gold` copies made with Athena CTAS (silver without populations): the job failed with `DataQualityError: population_found: 15 station-days without a population count on or before them`, and the gold copy's `metadata_location` didn't change, so nothing was published. The throwaway databases were dropped.
+  - An unknown source failed `source_pipeline`, and `NotifyFailure`'s `sns:publish` succeeded after the user confirmed the email subscription (whether the email arrived is for the user to confirm).
+
+**Learned:**
+- **Windows by calendar, not by rows.** `rowsBetween(-6, 0)` means "the last 7 rows", which after a missing day reaches back 8 days; `LAG` would treat the row before a gap as "yesterday". A range over `unix_date` and an explicit "is it really the previous day" test keep the numbers honest.
+- **As-of join in Spark:** a non-equi join (`reference_date <= reading_date`) plus `row_number` over the key, latest first. It's a left join on purpose: a day with no count keeps a null population, which the checks reject, instead of silently dropping the row.
+- **Compute → check → write is what makes "never publish bad data" true.** The failing run left the published table's metadata pointer untouched: in Iceberg, the table *is* its current metadata file, and nothing was committed.
+- **Intrinsic functions in Step Functions (`States.Format`) treat `\` as a special character**, so a `\n` in the template fails validation (`must be a valid JSONPath or a valid intrinsic function call`). Terraform applied everything else first, a partial apply that the next plan finished.
+- **Step Functions already emits execution status events** to the default EventBridge bus, so "run gold after any source succeeds" is one rule with a filter on `stateMachineArn` and `status`: the AWS equivalent of Databricks table-update triggers.
+- An SNS email subscription stays `PendingConfirmation` until the recipient clicks the link; Terraform can't confirm it.
 
 ## 5. Backfill
 

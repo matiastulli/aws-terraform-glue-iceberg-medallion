@@ -31,7 +31,7 @@ Infrastructure (Terraform ≥ 1.10). `bootstrap/` is applied once with local sta
 ```sh
 terraform -chdir=terraform/bootstrap init && terraform -chdir=terraform/bootstrap apply   # state bucket + budget; needs terraform.tfvars (alert_email)
 terraform -chdir=terraform/bootstrap output -raw backend_hcl > terraform/backend.hcl
-terraform -chdir=terraform init -backend-config=backend.hcl
+terraform -chdir=terraform init -backend-config=backend.hcl   # the main stack also needs terraform/terraform.tfvars (alert_email, for SNS)
 terraform -chdir=terraform plan -out=tfplan && terraform -chdir=terraform apply tfplan   # review the plan before applying
 terraform -chdir=terraform fmt -recursive && terraform -chdir=terraform validate
 ```
@@ -42,6 +42,7 @@ Deploy and run (CD from the laptop; deploy order is `terraform apply` → `apply
 export JAVA_HOME=$(/usr/libexec/java_home -v 17); .venv/bin/pytest          # pure logic on local PySpark (pyproject sets pythonpath=src)
 aws glue start-job-run --job-name apply_ddl --arguments '{"--dry_run":"true"}'   # list pending migrations; without the argument, apply them
 aws stepfunctions start-execution --state-machine-arn <source_pipeline ARN> --name <source>-<date>-a --input '{"source":"open_meteo_hourly","date":"2026-09-20"}'   # one source per execution; date optional (default: today - lag_days); the name becomes _batch_id
+aws stepfunctions start-execution --state-machine-arn <gold_pipeline ARN> --input '{"triggered_by":"manual"}'   # also starts by itself when any source_pipeline succeeds (EventBridge rule)
 aws scheduler update-schedule ...                                           # schedules source_pipeline-<source> are deployed DISABLED; enable one on purpose
 aws glue start-job-run --job-name clean_readings --arguments '{"--batch_id":"<execution name>"}'   # re-clean one bronze batch; a rerun must report new: 0, changed: 0
 aws glue get-job-run --job-name load_raw_files --run-id <id>                 # job stdout is in CloudWatch /aws-glue/jobs/output/<run id>

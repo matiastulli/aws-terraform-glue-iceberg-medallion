@@ -1,0 +1,56 @@
+{
+  "Comment": "Rebuild gold after any source_pipeline execution succeeds (EventBridge rule), or on demand. The job runs compute -> data quality checks -> write, so a failing check fails this execution before anything is published, and the alert says which check.",
+  "StartAt": "BuildReadingMetrics",
+  "States": {
+    "BuildReadingMetrics": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${build_job}"
+      },
+      "ResultSelector": {
+        "job_run_id.$": "$.Id",
+        "execution_seconds.$": "$.ExecutionTime"
+      },
+      "ResultPath": "$.build",
+      "Retry": [
+        {
+          "Comment": "Two sources finishing together start two rebuilds; the job allows one run at a time, so the second waits and retries. A failed run (e.g. a data quality check) isn't retried: it would fail the same way",
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException",
+            "Glue.ThrottlingException",
+            "Glue.InternalServiceException"
+          ],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 5,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "End": true
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${alerts_topic}",
+        "Subject": "weather-lakehouse: gold_pipeline failed",
+        "Message.$": "States.Format('Execution {} failed, nothing was published. Error: {} -- Cause: {}', $$.Execution.Name, $.error.Error, $.error.Cause)"
+      },
+      "ResultPath": null,
+      "Next": "Failed"
+    },
+    "Failed": {
+      "Type": "Fail",
+      "Error": "GoldPipelineFailed"
+    }
+  }
+}

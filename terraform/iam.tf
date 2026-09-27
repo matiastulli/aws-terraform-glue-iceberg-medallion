@@ -4,6 +4,7 @@ data "aws_iam_policy_document" "assume" {
     lambda         = "lambda.amazonaws.com"
     step_functions = "states.amazonaws.com"
     scheduler      = "scheduler.amazonaws.com"
+    events         = "events.amazonaws.com"
   }
   statement {
     actions = ["sts:AssumeRole"]
@@ -82,7 +83,11 @@ data "aws_iam_policy_document" "step_functions" {
   }
   statement {
     actions   = ["glue:StartJobRun", "glue:GetJobRun", "glue:GetJobRuns", "glue:BatchStopJobRun"]
-    resources = [for job in ["load_raw_files", "clean_readings", "clean_populations"] : aws_glue_job.this[job].arn]
+    resources = [for job in ["load_raw_files", "clean_readings", "clean_populations", "build_reading_metrics"] : aws_glue_job.this[job].arn]
+  }
+  statement {
+    actions   = ["sns:Publish"]
+    resources = [aws_sns_topic.alerts.arn]
   }
 }
 
@@ -109,4 +114,23 @@ resource "aws_iam_role_policy" "scheduler" {
   name   = "start-source-pipeline"
   role   = aws_iam_role.scheduler.id
   policy = data.aws_iam_policy_document.scheduler.json
+}
+
+# EventBridge rule: start gold_pipeline executions, nothing else.
+resource "aws_iam_role" "events" {
+  name               = "${var.project}-events"
+  assume_role_policy = data.aws_iam_policy_document.assume["events"].json
+}
+
+data "aws_iam_policy_document" "events" {
+  statement {
+    actions   = ["states:StartExecution"]
+    resources = [aws_sfn_state_machine.gold_pipeline.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "events" {
+  name   = "start-gold-pipeline"
+  role   = aws_iam_role.events.id
+  policy = data.aws_iam_policy_document.events.json
 }

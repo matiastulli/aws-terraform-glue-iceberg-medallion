@@ -6,10 +6,11 @@ locals {
   medallion_py = fileset("${local.src}/medallion", "*.py")
   ddl_files    = fileset(local.src, "*/*/ddl_*.sql") # medallion/migrations.py GLOB
   glue_scripts = {
-    apply_ddl         = "ops/schema_migrations/glue_job_apply_ddl.py"
-    load_raw_files    = "00_bronze/_ingestion/glue_job_load_raw_files.py"
-    clean_readings    = "01_silver/readings/glue_job_clean_readings.py"
-    clean_populations = "01_silver/populations/glue_job_clean_populations.py"
+    apply_ddl             = "ops/schema_migrations/glue_job_apply_ddl.py"
+    load_raw_files        = "00_bronze/_ingestion/glue_job_load_raw_files.py"
+    clean_readings        = "01_silver/readings/glue_job_clean_readings.py"
+    clean_populations     = "01_silver/populations/glue_job_clean_populations.py"
+    build_reading_metrics = "02_gold/agg_readings_daily/glue_job_build_reading_metrics.py"
   }
 }
 

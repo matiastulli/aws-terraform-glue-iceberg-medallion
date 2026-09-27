@@ -13,3 +13,8 @@ variable "athena_bytes_scanned_cutoff" {
   type    = number
   default = 1073741824 # 1 GiB
 }
+
+variable "alert_email" {
+  description = "Where pipeline failure alerts go (SNS email). Set it in terraform.tfvars (gitignored)."
+  type        = string
+}

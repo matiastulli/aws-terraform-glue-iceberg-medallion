@@ -24,7 +24,8 @@ Terraform in [`terraform/`](terraform/), region `us-east-2`:
 - [`terraform/`](terraform/): S3 buckets `raw` (landing JSON), `lake` (Iceberg warehouse), `athena-results` and `artifacts` (deployed code); Glue Data Catalog databases `00_bronze`, `01_silver`, `02_gold` (numbered so they sort in pipeline order) and `ops`; and an Athena workgroup that enforces the result location and a per-query bytes-scanned limit.
 
 ```sh
-cp terraform/bootstrap/terraform.tfvars.example terraform/bootstrap/terraform.tfvars   # set alert_email
+cp terraform/bootstrap/terraform.tfvars.example terraform/bootstrap/terraform.tfvars   # set alert_email (budget)
+cp terraform/terraform.tfvars.example terraform/terraform.tfvars                       # set alert_email (pipeline alerts)
 terraform -chdir=terraform/bootstrap init && terraform -chdir=terraform/bootstrap apply
 terraform -chdir=terraform/bootstrap output -raw backend_hcl > terraform/backend.hcl
 terraform -chdir=terraform init -backend-config=backend.hcl && terraform -chdir=terraform apply
@@ -46,7 +47,16 @@ EventBridge Scheduler (one schedule per source, deployed disabled)
        ├─ Glue load_raw_files    raw JSON → "00_bronze".<source> (Iceberg, append-only)
        └─ Glue <silver_job>      the batch → "01_silver".<entity> (MERGE on its key)
                                              + "01_silver".<entity>_quarantine (rejects with rejection_reasons)
+                 │ succeeded (EventBridge rule)
+                 ▼
+Step Functions gold_pipeline
+  └─ Glue build_reading_metrics  readings + populations → "02_gold".agg_readings_daily
+                                 compute → data quality checks → write (only if they pass, only if something changed)
+
+Any failure → SNS topic weather-lakehouse-alerts → email
 ```
+
+`"02_gold".agg_readings_daily` has one row per station and day: temperature min/max/avg, a 7-day rolling average and the change vs the previous day, humidity, rain, max wind, and the city's population as of that day (the latest Wikidata count on or before it).
 
 - Sources and stations are configured in [`config/sources.toml`](config/sources.toml). Table names, raw paths, API requests, the silver job and the default run date are derived from it. A failing source never blocks another.
 - Code is grouped by entity: `src/<NN_layer>/<entity>/` holds the entity's migrations (`ddl_<table>_v<NNN>_<verb>.sql`) and the job that writes it (`glue_job_<process>.py`); processes that serve every source are in `src/00_bronze/_ingestion/`.
@@ -68,4 +78,5 @@ SELECT station_id, cardinality(hourly.time) AS hours FROM "00_bronze".open_meteo
 SELECT station_id, observed_at, temperature_c FROM "01_silver".readings ORDER BY observed_at DESC LIMIT 10;
 SELECT * FROM "01_silver"."readings$snapshots";   -- Iceberg metadata table: one snapshot per commit
 SELECT station_id, reference_date, population FROM "01_silver".populations ORDER BY 1, 2;
+SELECT station_id, reading_date, temperature_avg_c, precipitation_total_mm, population FROM "02_gold".agg_readings_daily ORDER BY 1, 2;
 ```

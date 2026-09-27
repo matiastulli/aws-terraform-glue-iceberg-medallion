@@ -48,6 +48,17 @@ locals {
         "--batch_id"  = "set-per-run"
       }
     }
+    build_reading_metrics = {
+      description = "Rebuild 02_gold.agg_readings_daily: compute, run the data quality checks, write only if they pass"
+      # One at a time: two full rebuilds racing would only repeat each other. A second start fails with
+      # ConcurrentRunsExceededException, which gold_pipeline retries.
+      max_concurrent_runs = 1
+      arguments = {
+        "--catalog"   = local.catalog
+        "--silver_db" = aws_glue_catalog_database.this["01_silver"].name
+        "--gold_db"   = aws_glue_catalog_database.this["02_gold"].name
+      }
+    }
     clean_populations = {
       description = "Validate and MERGE one bronze batch (--batch_id) of Wikidata population statements into 01_silver.populations"
       arguments = {
@@ -78,7 +89,7 @@ resource "aws_glue_job" "this" {
   }
 
   execution_property {
-    max_concurrent_runs = 3
+    max_concurrent_runs = lookup(each.value, "max_concurrent_runs", 3)
   }
 
   default_arguments = merge(each.value.arguments, {
