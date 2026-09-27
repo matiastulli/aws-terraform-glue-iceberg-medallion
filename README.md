@@ -4,6 +4,54 @@ A medallion lakehouse (bronze → silver → gold) on AWS, built with **Apache I
 
 It's the AWS counterpart of [databricks-pyspark-delta-medallion](https://github.com/matiastulli/databricks-pyspark-delta-medallion). The build is done one step at a time; [`docs/PLAN.md`](docs/PLAN.md) tracks the steps and what each one taught.
 
+## Architecture
+
+**Data flow.** Each source's API response lands untouched in S3, then moves through Iceberg tables layer by layer. Silver is written with an idempotent `MERGE` on each entity's key, and invalid rows go to a quarantine table with the rules they broke. Gold is published only after its data quality checks pass. Tables are created and changed only by versioned migrations (`apply_ddl`), never by the jobs that write to them.
+
+```mermaid
+flowchart LR
+    om["Open-Meteo archive<br/>hourly weather"] --> ingest
+    wd["Wikidata SPARQL<br/>city population"] --> ingest
+    ingest["Lambda<br/>ingest_source"] --> raw[("S3 raw<br/>JSON as received")]
+
+    subgraph lakehouse["Apache Iceberg tables on S3, in the Glue Data Catalog"]
+        bronze[("00_bronze<br/>open_meteo_hourly<br/>wikidata_population")]
+        silver[("01_silver<br/>readings · populations")]
+        quarantine[("01_silver<br/>*_quarantine")]
+        gold[("02_gold<br/>agg_readings_daily")]
+    end
+
+    raw --> load["Glue<br/>load_raw_files"] -- append --> bronze
+    bronze --> clean["Glue<br/>clean_readings<br/>clean_populations"]
+    clean -- MERGE --> silver
+    clean -- rejects --> quarantine
+    silver --> build["Glue<br/>build_reading_metrics<br/>compute → checks → write"] --> gold
+    gold --> athena["Athena<br/>SQL"]
+
+    ddl["Glue<br/>apply_ddl"] -. versioned migrations .-> lakehouse
+```
+
+**Orchestration.** One generic state machine runs once per source, so a failing source never blocks another. Gold rebuilds itself whenever any source succeeds, and any failure sends an email.
+
+```mermaid
+flowchart LR
+    sched["EventBridge Scheduler<br/>one schedule per source"] -- "{source}" --> sp
+
+    subgraph sp["Step Functions: source_pipeline (one execution per source)"]
+        direction LR
+        i["Ingest<br/>Lambda"] --> l["Load<br/>Glue"] --> c["Clean<br/>Glue silver_job"]
+    end
+
+    sp -- succeeded --> rule["EventBridge rule"] --> gp
+
+    subgraph gp["Step Functions: gold_pipeline"]
+        b["Build<br/>Glue build_reading_metrics"]
+    end
+
+    sp -. failed .-> sns["SNS<br/>email alert"]
+    gp -. failed .-> sns
+```
+
 ## Local setup
 
 Python 3.11 and Java 17. Versions match AWS Glue 5.1 (Spark 3.5.6, Iceberg 1.10.0).
@@ -40,21 +88,13 @@ Two sources, each run as its own execution of one generic state machine:
 | `open_meteo_hourly` | [Open-Meteo archive](https://open-meteo.com/en/docs/historical-weather-api): hourly temperature, humidity, precipitation, wind | `readings` (one row per station-hour) | daily |
 | `wikidata_population` | [Wikidata SPARQL](https://query.wikidata.org/): each city's population counts with their dates | `populations` (one row per station and count date) | monthly |
 
-```
-EventBridge Scheduler (one schedule per source, deployed disabled)
-  └─ Step Functions source_pipeline ({"source": "<bronze table>", "date": "YYYY-MM-DD"})
-       ├─ Lambda ingest_source   the source's API → s3://<raw>/<system>/<table>/date=…/<station_id>.json
-       ├─ Glue load_raw_files    raw JSON → "00_bronze".<source> (Iceberg, append-only)
-       └─ Glue <silver_job>      the batch → "01_silver".<entity> (MERGE on its key)
-                                             + "01_silver".<entity>_quarantine (rejects with rejection_reasons)
-                 │ succeeded (EventBridge rule)
-                 ▼
-Step Functions gold_pipeline
-  └─ Glue build_reading_metrics  readings + populations → "02_gold".agg_readings_daily
-                                 compute → data quality checks → write (only if they pass, only if something changed)
+Each `source_pipeline` execution takes `{"source": "<bronze table>", "date": "YYYY-MM-DD"}` (the date is optional) and runs three steps:
 
-Any failure → SNS topic weather-lakehouse-alerts → email
-```
+1. **Ingest** (Lambda `ingest_source`): calls the source's API for every station and writes each response to `s3://<raw>/<system>/<table>/date=YYYY-MM-DD/<station_id>.json`.
+2. **Load** (Glue `load_raw_files`): appends that day's files to `"00_bronze".<source>`, read with the table's own schema (no inference) and tagged with `_batch_id` (the execution name), `_ingested_at` and `_source_file`.
+3. **Clean** (the source's `silver_job` in config): flattens, validates and deduplicates the batch, then `MERGE`s it into `"01_silver".<entity>`, with rejects in `"01_silver".<entity>_quarantine`. A rerun of the same batch writes nothing.
+
+When it succeeds, an EventBridge rule starts `gold_pipeline`, which rebuilds `"02_gold".agg_readings_daily` in the order compute → data quality checks → write. It writes only if every check passes and something changed. Schedules (EventBridge Scheduler, one per source) are deployed disabled; failures go to the SNS topic `weather-lakehouse-alerts`.
 
 `"02_gold".agg_readings_daily` has one row per station and day: temperature min/max/avg, a 7-day rolling average and the change vs the previous day, humidity, rain, max wind, and the city's population as of that day (the latest Wikidata count on or before it).
 
