@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local Spark + Iceberg warehouse
+spark-warehouse/
+local-warehouse/
+metastore_db/
+derby.log
+
+# Terraform: local plugins and state (state can hold resource details)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+
+# Secrets / OS
+.env
+.DS_Store
