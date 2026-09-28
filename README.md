@@ -1,43 +1,62 @@
 # AWS Glue + Iceberg medallion lakehouse
 
+[![CI](https://github.com/matiastulli/aws-terraform-glue-iceberg-medallion/actions/workflows/ci.yml/badge.svg)](https://github.com/matiastulli/aws-terraform-glue-iceberg-medallion/actions/workflows/ci.yml)
+![AWS Glue](https://img.shields.io/badge/AWS_Glue-5.1-FF9900)
+![Apache Iceberg](https://img.shields.io/badge/Apache_Iceberg-1.10-3D8BD7)
+![PySpark](https://img.shields.io/badge/PySpark-3.5.6-E25A1C?logo=apachespark&logoColor=white)
+![Terraform](https://img.shields.io/badge/Terraform-%E2%89%A51.10-7B42BC?logo=terraform&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+
 A medallion lakehouse (bronze → silver → gold) on AWS, built with **Apache Iceberg**, **AWS Glue** (PySpark), **Athena**, **Step Functions** and **Terraform**, using hourly weather-station telemetry.
 
 It's the AWS counterpart of [databricks-pyspark-delta-medallion](https://github.com/matiastulli/databricks-pyspark-delta-medallion). The build is done one step at a time; [`docs/PLAN.md`](docs/PLAN.md) tracks the steps and what each one taught.
 
 ## Architecture
 
-**Data flow.** Each source's API response lands untouched in S3, then moves through Iceberg tables layer by layer. Simulated live sensors take a second path into bronze: an SQS queue and a Lambda that appends with pyiceberg, without Spark. Silver is written with an idempotent `MERGE` on each entity's key, and invalid rows go to a quarantine table with the rules they broke. Gold is published only after its data quality checks pass. Tables are created and changed only by versioned migrations (`apply_ddl`), never by the jobs that write to them.
+**Data flow.** Each source's API response lands untouched in S3, then moves through Iceberg tables layer by layer. Simulated live sensors take a second path: an SQS queue and a Lambda that appends to bronze with pyiceberg, then a Spark Structured Streaming job that carries them to silver. Silver is written with an idempotent `MERGE` on each entity's key, and invalid rows go to a quarantine table with the rules they broke. Gold is published only after its data quality checks pass, and an analyst reads it through Lake Formation, filtered by row and column. DynamoDB serves reads by key: the newest reading per station, and where each stream stopped, which table maintenance respects. Tables are created and changed only by versioned migrations (`apply_ddl`), never by the jobs that write to them.
 
 ```mermaid
 flowchart LR
     om["Open-Meteo archive<br/>hourly weather"] --> ingest
     wd["Wikidata SPARQL<br/>city population"] --> ingest
     ingest["Lambda<br/>ingest_source"] --> raw[("S3 raw<br/>JSON as received")]
-    sim["Lambda<br/>simulate_sensors<br/>every minute"] --> sqs["SQS<br/>simulator_readings"] --> consume["Lambda<br/>consume_sensor_readings<br/>pyiceberg"]
+    sim["Lambda<br/>simulate_sensors"] --> sqs["SQS<br/>simulator_readings"] --> consume["Lambda<br/>consume_sensor_readings<br/>pyiceberg"]
     sqs -. "write failed 3 times" .-> dlq["SQS<br/>simulator_readings-dlq"] -. alarm .-> sns["SNS<br/>email alert"]
 
     subgraph lakehouse["Apache Iceberg tables on S3, in the Glue Data Catalog"]
         bronze[("00_bronze<br/>open_meteo_hourly<br/>wikidata_population<br/>simulator_readings")]
         bquarantine[("00_bronze<br/>simulator_readings_quarantine")]
-        silver[("01_silver<br/>readings · populations")]
+        silver[("01_silver<br/>readings · populations<br/>sensor_readings")]
         quarantine[("01_silver<br/>*_quarantine")]
         gold[("02_gold<br/>agg_readings_daily")]
+    end
+
+    subgraph ddb["DynamoDB"]
+        latest[("latest-readings<br/>one item per station")]
+        wm[("watermarks<br/>where each stream stopped")]
     end
 
     raw --> load["Glue<br/>load_raw_files"] -- append --> bronze
     consume -- "append<br/>one commit per batch" --> bronze
     consume -- malformed --> bquarantine
+    consume -- "newest per station<br/>conditional write" --> latest
     bronze --> clean["Glue<br/>clean_readings<br/>clean_populations"]
+    bronze -- "Structured Streaming" --> stream["Glue<br/>clean_sensor_readings<br/>trigger once"]
     clean -- MERGE --> silver
+    stream -- MERGE --> silver
     clean -- rejects --> quarantine
+    stream -- rejects --> quarantine
+    stream -- "last snapshot read" --> wm
     silver --> build["Glue<br/>build_reading_metrics<br/>compute → checks → write"] --> gold
     gold --> athena["Athena<br/>SQL"]
+    analyst["Analyst role"] -- "Lake Formation<br/>row + column filter" --> athena
 
     ddl["Glue<br/>apply_ddl"] -. versioned migrations .-> lakehouse
     maintain["Glue<br/>maintain_tables"] -. "compact · expire · orphans" .-> lakehouse
+    wm -. "never expire past it" .-> maintain
 ```
 
-**Orchestration.** One generic state machine runs once per source, so a failing source never blocks another. Gold rebuilds itself whenever any source succeeds, and any failure sends an email. A backfill runs that same state machine once per date, then gold once.
+**Orchestration.** One generic state machine runs once per source, so a failing source never blocks another. Gold rebuilds itself whenever any source succeeds, and any failure sends an email. A backfill runs that same state machine once per date, then gold once. Single jobs with no steps to chain (the sensor simulator, the sensor stream to silver, table maintenance) are started by EventBridge Scheduler directly, and the SQS consumer by its event source mapping. Every schedule is deployed disabled.
 
 ```mermaid
 flowchart LR
@@ -58,6 +77,14 @@ flowchart LR
 
     sp -. failed .-> sns["SNS<br/>email alert"]
     gp -. failed .-> sns
+
+    subgraph direct["Started directly, no state machine"]
+        direction LR
+        s2["EventBridge Scheduler"] -- "every minute" --> sim["Lambda<br/>simulate_sensors"]
+        s2 -- hourly --> csr["Glue<br/>clean_sensor_readings"]
+        s2 -- "weekly" --> mt["Glue<br/>maintain_tables"]
+        q["SQS"] -- "event source mapping<br/>100 messages or 20 s" --> cons["Lambda<br/>consume_sensor_readings"]
+    end
 ```
 
 ## Local setup
@@ -72,6 +99,28 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 
 The smoke test creates an Iceberg table partitioned by `days(observed_at)` in `./local-warehouse`, upserts into it with `MERGE INTO`, and reads the first snapshot back with time travel.
 
+## Connect to AWS
+
+Nothing in the repo holds credentials: Terraform, the AWS CLI and the scripts all use the standard AWS credential chain (a CLI profile, SSO, or environment variables), so there is no `.env` to fill in.
+
+1. Install [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) and [Terraform](https://developer.hashicorp.com/terraform/install) ≥ 1.10.
+2. Sign in with an identity that can create the whole stack (IAM roles and policies, S3, Glue, Athena, Lambda, Step Functions, EventBridge, SQS, SNS, DynamoDB, CloudWatch, Lake Formation). In a personal account that's an administrator; in an organization, prefer IAM Identity Center:
+
+   ```sh
+   aws configure sso          # IAM Identity Center: short-lived credentials, nothing stored long-term
+   # or
+   aws configure              # an IAM user's access keys, kept in ~/.aws/credentials (never in the repo)
+   ```
+
+3. Point every tool at the same profile and region, and check who you are:
+
+   ```sh
+   export AWS_PROFILE=<your profile> AWS_REGION=us-east-2   # skip AWS_PROFILE if you used the default profile
+   aws sts get-caller-identity                              # the account and identity Terraform will use
+   ```
+
+The identity that runs Terraform also becomes the Lake Formation data lake admin (`terraform/lakeformation.tf`). To deploy to another region, set `region` in both `terraform.tfvars` files and `AWS_REGION` to match.
+
 ## Infrastructure
 
 Terraform in [`terraform/`](terraform/), region `us-east-2`:
@@ -84,8 +133,13 @@ cp terraform/bootstrap/terraform.tfvars.example terraform/bootstrap/terraform.tf
 cp terraform/terraform.tfvars.example terraform/terraform.tfvars                       # set alert_email (pipeline alerts)
 terraform -chdir=terraform/bootstrap init && terraform -chdir=terraform/bootstrap apply
 terraform -chdir=terraform/bootstrap output -raw backend_hcl > terraform/backend.hcl
-terraform -chdir=terraform init -backend-config=backend.hcl && terraform -chdir=terraform apply
+scripts/build_pyiceberg_layer.sh                                                        # the stream consumer's Lambda layer (Linux wheels)
+terraform -chdir=terraform init -backend-config=backend.hcl
+terraform -chdir=terraform plan -out=tfplan && terraform -chdir=terraform apply tfplan
+aws glue start-job-run --job-name apply_ddl                                             # create the tables (migrations)
 ```
+
+Then confirm the SNS subscription email (alerts only arrive after that). Every schedule is deployed disabled, so nothing runs, and nothing is billed, until you start a pipeline or enable a schedule.
 
 ## Pipeline
 
