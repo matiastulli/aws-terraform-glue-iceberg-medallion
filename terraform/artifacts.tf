@@ -12,6 +12,7 @@ locals {
     clean_populations     = "01_silver/populations/glue_job_clean_populations.py"
     build_reading_metrics = "02_gold/agg_readings_daily/glue_job_build_reading_metrics.py"
     maintain_tables       = "ops/_maintenance/glue_job_maintain_tables.py"
+    clean_sensor_readings = "01_silver/sensor_readings/glue_job_clean_sensor_readings.py"
   }
 }
 

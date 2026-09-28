@@ -34,6 +34,11 @@ data "aws_iam_policy_document" "glue" {
     resources = flatten([for b in ["artifacts", "raw"] : [aws_s3_bucket.this[b].arn, "${aws_s3_bucket.this[b].arn}/*"]])
   }
   statement {
+    sid       = "StreamWatermarks"
+    actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Scan"]
+    resources = [aws_dynamodb_table.watermarks.arn]
+  }
+  statement {
     sid       = "ReadWriteLake"
     actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
     resources = [aws_s3_bucket.this["lake"].arn, "${aws_s3_bucket.this["lake"].arn}/*"]
@@ -118,7 +123,8 @@ resource "aws_iam_role_policy" "step_functions" {
   policy = data.aws_iam_policy_document.step_functions.json
 }
 
-# EventBridge Scheduler: start source_pipeline executions, invoke the sensor simulator and start table maintenance.
+# EventBridge Scheduler: start source_pipeline executions, invoke the sensor simulator, and start the maintenance and
+# sensor silver jobs.
 resource "aws_iam_role" "scheduler" {
   name               = "${var.project}-scheduler"
   assume_role_policy = data.aws_iam_policy_document.assume["scheduler"].json
@@ -135,7 +141,7 @@ data "aws_iam_policy_document" "scheduler" {
   }
   statement {
     actions   = ["glue:StartJobRun"]
-    resources = [aws_glue_job.this["maintain_tables"].arn]
+    resources = [for job in ["maintain_tables", "clean_sensor_readings"] : aws_glue_job.this[job].arn]
   }
 }
 

@@ -499,7 +499,25 @@ Verified on AWS (queries in the `weather-lakehouse` workgroup):
 
 ## 9. Spark Structured Streaming
 
-- A Glue job reading landed files with `readStream`, `trigger(availableNow=True)` and a checkpoint in S3, writing to Iceberg: Glue's equivalent of Auto Loader, billed as a batch job
-- A DynamoDB table as the pipeline's watermark/control table (bookkeeping, so named under `ops`). The watermark advances only after the checks pass. The checkpoint is never deleted to "clean up".
+**Goal:** move the live readings from bronze to silver incrementally with Spark Structured Streaming, and keep a watermark in DynamoDB that the table maintenance respects.
+
+Changed from the first plan: step 6 lands the stream directly in an Iceberg table, not in files, so there's nothing for an Auto Loader-style file stream to read. The source is the bronze table itself: `spark.readStream.format("iceberg")` reads only the snapshots appended since the last run.
+
+Decisions (with the user, before the code):
+- **A new silver entity, `01_silver.sensor_readings`** (+ its quarantine), keyed `(station_id, observed_at)` at the minute. Mixing minute readings into the hourly `readings`, from a second source, would need a precedence rule.
+- **DynamoDB holds a watermark and guards maintenance:** after a successful run, the job records the last bronze snapshot it consumed, with a conditional write that only moves forward. `maintain_tables` reads it and never expires a snapshot the stream still needs.
+
+Tried locally first (Iceberg 1.10 streaming source, a checkpoint, `foreachBatch`):
+- Runs read only new appends (5 rows, then 0, then 4), and **compaction doesn't disturb the stream**: `replace` snapshots (from `rewrite_data_files`) are skipped.
+- **Expiring snapshots the stream hasn't read breaks it:** `Cannot load current offset at snapshot …, the snapshot was expired`.
+- **With `trigger(availableNow=True)`, keeping the last-read snapshot isn't enough:** it fails on the table's *first* snapshot, where the stream started, because availableNow plans from the stream's initial offset. **With `trigger(once=True)` it works:** after expiring everything older than the last-read snapshot, the next runs read the new rows. So the job uses `once` (the older trigger: all pending data in one micro-batch, fine at this size), and the watermark is exactly what it needs kept.
+- `collect()` returns timestamps in the laptop's time zone (step 3's lesson again): a cutoff built from them in Python was 3 hours off. The job formats timestamps in Spark (UTC).
+
+Design:
+- **Glue job `clean_sensor_readings`** (`src/01_silver/sensor_readings/`): `readStream` on `"00_bronze".simulator_readings`, `trigger(once=True)`, checkpoint in `s3://<lake>/_checkpoints/clean_sensor_readings/` (never deleted: that's a full reprocess), and `foreachBatch` doing what the batch silver jobs do: validate (nulls explicit, physical ranges shared with `readings`, `observed_at` parsed from ISO 8601), split, dedup on the key (latest `_ingested_at`, then `_message_id`), reconcile, contract, classify against silver bounded to the batch's range, `MERGE`, quarantine. At-least-once from the checkpoint + an idempotent `MERGE` = effectively exactly-once. No Spark event-time watermark: there's no stateful aggregation, and late readings are simply merged at their minute.
+- **One run at a time** (`max_concurrent_runs` 1): two runs on one checkpoint would corrupt it.
+- **DynamoDB table `weather-lakehouse-watermarks`** (on-demand, key `process`). After the query ends without error, the job writes `source_table`, `snapshot_id`, `snapshot_committed_at` (UTC) and the run's counts, on condition that `snapshot_committed_at` doesn't go backwards. A failed run writes nothing, so the watermark only advances after the checks pass.
+- **`maintain_tables`** reads the watermarks and, for a table a stream reads, expires only snapshots older than the watermark's `snapshot_committed_at` (the earlier of that and its own cutoff). The cutoff choice is a pure, tested function.
+- An hourly schedule for the job, deployed DISABLED.
 
 ## 10. Complete tests

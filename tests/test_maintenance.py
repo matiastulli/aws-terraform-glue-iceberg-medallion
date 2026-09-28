@@ -2,7 +2,7 @@ import datetime as dt
 
 import pytest
 
-from medallion.maintenance import Options, expire_snapshots_sql, procedure_table, remove_orphan_files_sql, rewrite_data_files_sql
+from medallion.maintenance import Options, expire_cutoff, expire_snapshots_sql, procedure_table, remove_orphan_files_sql, rewrite_data_files_sql
 
 NOW = dt.datetime(2026, 9, 28, 18, 30, 15, tzinfo=dt.timezone.utc)
 TABLE = procedure_table("01_silver", "readings")
@@ -24,7 +24,7 @@ def test_rewrite_all_is_opt_in():
 def test_expiry_and_orphan_cutoffs_are_utc_literals_counted_back_from_now():
     options = Options(expire_older_than_days=7, retain_last=5, orphan_older_than_days=3)
 
-    assert expire_snapshots_sql("glue_catalog", TABLE, options, NOW).endswith(
+    assert expire_snapshots_sql("glue_catalog", TABLE, options, expire_cutoff(options, NOW, None)).endswith(
         "older_than => TIMESTAMP '2026-09-21 18:30:15', retain_last => 5)"
     )
     assert remove_orphan_files_sql("glue_catalog", TABLE, options, NOW).endswith(
@@ -33,6 +33,18 @@ def test_expiry_and_orphan_cutoffs_are_utc_literals_counted_back_from_now():
     # A cutoff given in another time zone is the same instant in UTC.
     buenos_aires = NOW.astimezone(dt.timezone(dt.timedelta(hours=-3)))
     assert expire_snapshots_sql("glue_catalog", TABLE, options, buenos_aires) == expire_snapshots_sql("glue_catalog", TABLE, options, NOW)
+
+
+def test_expiry_never_passes_the_snapshot_a_stream_last_consumed():
+    # The stream's checkpoint needs its last snapshot to find the next ones; expiring it broke the stream (step 9).
+    options = Options(expire_older_than_days=7)
+    stream_behind = NOW - dt.timedelta(days=10)
+    stream_current = NOW - dt.timedelta(minutes=5)
+
+    assert expire_cutoff(options, NOW, stream_behind) == stream_behind
+    assert expire_cutoff(options, NOW, stream_current) == NOW - dt.timedelta(days=7)
+    assert expire_cutoff(Options(expire_older_than_days=0), NOW, stream_current) == stream_current
+    assert expire_cutoff(options, NOW, None) == NOW - dt.timedelta(days=7)
 
 
 @pytest.mark.parametrize(

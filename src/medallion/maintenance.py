@@ -53,8 +53,14 @@ def rewrite_manifests_sql(catalog: str, table: str) -> str:
     return f"CALL `{catalog}`.system.rewrite_manifests(table => '{table}')"
 
 
-def expire_snapshots_sql(catalog: str, table: str, options: Options, now: dt.datetime) -> str:
-    older_than = now - dt.timedelta(days=options.expire_older_than_days)
+def expire_cutoff(options: Options, now: dt.datetime, stream_watermark: dt.datetime | None) -> dt.datetime:
+    """Snapshots older than this may expire. For a table a stream reads (a watermark in DynamoDB), never past the last
+    snapshot the stream consumed: its checkpoint needs that snapshot to find what came after (docs/PLAN.md step 9)."""
+    cutoff = now - dt.timedelta(days=options.expire_older_than_days)
+    return cutoff if stream_watermark is None else min(cutoff, stream_watermark)
+
+
+def expire_snapshots_sql(catalog: str, table: str, options: Options, older_than: dt.datetime) -> str:
     return (
         f"CALL `{catalog}`.system.expire_snapshots(table => '{table}', older_than => {_timestamp(older_than)}, "
         f"retain_last => {options.retain_last})"

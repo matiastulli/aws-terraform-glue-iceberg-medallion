@@ -37,10 +37,13 @@ def split_valid_and_rejected(df: DataFrame) -> tuple[DataFrame, DataFrame]:
     return df.where(is_valid), df.where(~is_valid)
 
 
-def dedup_latest(valid: DataFrame, key: Sequence[str], prefer: Sequence[Column] = ()) -> DataFrame:
+def dedup_latest(
+    valid: DataFrame, key: Sequence[str], prefer: Sequence[Column] = (), tiebreak: Sequence[str] = ("_batch_id", "_source_file")
+) -> DataFrame:
     """One row per key. `prefer` orders candidates first (e.g. Wikidata's preferred rank); then the most recently
-    ingested wins, with ties broken on batch and file, so the winner never depends on how Spark ordered the rows."""
-    order = [*prefer, F.desc("_ingested_at"), F.desc("_batch_id"), F.desc("_source_file")]
+    ingested wins, with ties broken on `tiebreak` (batch and file; batch and SQS message for a stream), so the winner
+    never depends on how Spark ordered the rows."""
+    order = [*prefer, F.desc("_ingested_at"), *[F.desc(column) for column in tiebreak]]
     ranked = valid.withColumn("_rank", F.row_number().over(Window.partitionBy(*key).orderBy(*order)))
     return ranked.where("_rank = 1").drop("_rank")
 

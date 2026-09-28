@@ -4,6 +4,8 @@ after. The SQL and its safety limits come from medallion/maintenance.py; this jo
 
 --tables: comma-separated db.table, or all (every Iceberg table in --databases).
 --expire_older_than_days / --retain_last: snapshots older than N days go, but the last --retain_last always stay.
+  A table a stream reads keeps every snapshot from its last consumed one on: the stream's watermark, read from the
+  DynamoDB table --watermark_table (docs/PLAN.md step 9).
 --orphan_older_than_days: never under 1 (Iceberg refuses; a younger file may belong to a commit in progress).
 --rewrite_all true: rewrite every data file, e.g. once after a partition change moves new data to a new spec.
 --dry_run true: list orphan files without deleting them (compaction and expiry still run).
@@ -16,11 +18,13 @@ import datetime as dt
 import json
 import sys
 
+import boto3
 from awsglue.utils import getResolvedOptions
 from pyspark.sql import SparkSession
 
 from medallion.maintenance import (
     Options,
+    expire_cutoff,
     expire_snapshots_sql,
     procedure_table,
     remove_orphan_files_sql,
@@ -30,7 +34,7 @@ from medallion.maintenance import (
 
 args = getResolvedOptions(
     sys.argv,
-    ["JOB_NAME", "catalog", "databases", "tables", "expire_older_than_days", "retain_last", "orphan_older_than_days", "rewrite_all", "dry_run"],
+    ["JOB_NAME", "catalog", "databases", "tables", "expire_older_than_days", "retain_last", "orphan_older_than_days", "rewrite_all", "dry_run", "watermark_table"],
 )
 catalog = args["catalog"]
 options = Options(
@@ -41,6 +45,12 @@ options = Options(
     dry_run=args["dry_run"] == "true",
 )
 spark = SparkSession.builder.getOrCreate()
+
+# Where each stream stopped: source table ("00_bronze.simulator_readings") -> commit time of its last consumed snapshot.
+stream_watermarks = {
+    item["source_table"]: dt.datetime.fromisoformat(item["snapshot_committed_at"])
+    for item in boto3.resource("dynamodb").Table(args["watermark_table"]).scan()["Items"]
+}
 
 
 def properties(database: str, table: str) -> dict[str, str]:
@@ -70,7 +80,9 @@ def maintain(database: str, table: str) -> dict:
     before = state(database, table)
     rewrite = spark.sql(rewrite_data_files_sql(catalog, target, properties(database, table).get("sort-order"), options.rewrite_all)).first()
     manifests = spark.sql(rewrite_manifests_sql(catalog, target)).first()
-    expired = spark.sql(expire_snapshots_sql(catalog, target, options, dt.datetime.now(dt.timezone.utc))).first()
+    watermark = stream_watermarks.get(f"{database}.{table}")
+    older_than = expire_cutoff(options, dt.datetime.now(dt.timezone.utc), watermark)
+    expired = spark.sql(expire_snapshots_sql(catalog, target, options, older_than)).first()
     orphans = spark.sql(remove_orphan_files_sql(catalog, target, options, dt.datetime.now(dt.timezone.utc))).collect()
     return {
         "table": f"{database}.{table}",
@@ -79,6 +91,8 @@ def maintain(database: str, table: str) -> dict:
         "rewritten_data_files": rewrite.rewritten_data_files_count,
         "added_data_files": rewrite.added_data_files_count,
         "rewritten_manifests": manifests.rewritten_manifests_count,
+        "expired_before": older_than.isoformat(timespec="seconds"),
+        "held_by_stream": watermark is not None and older_than == watermark,
         "expired": {"data_files": expired.deleted_data_files_count, "manifests": expired.deleted_manifest_files_count, "manifest_lists": expired.deleted_manifest_lists_count},
         "orphan_files": len(orphans),
         "orphans_deleted": not options.dry_run,

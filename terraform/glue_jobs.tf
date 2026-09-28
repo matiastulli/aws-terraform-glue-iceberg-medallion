@@ -72,6 +72,20 @@ locals {
         "--orphan_older_than_days" = "3"
         "--rewrite_all"            = "false"
         "--dry_run"                = "false"
+        "--watermark_table"        = aws_dynamodb_table.watermarks.name
+      }
+    }
+    clean_sensor_readings = {
+      description = "Structured Streaming (trigger once) from 00_bronze.simulator_readings to 01_silver.sensor_readings, watermark in DynamoDB"
+      # One at a time: two runs on one checkpoint would corrupt it.
+      max_concurrent_runs = 1
+      arguments = {
+        "--catalog"   = local.catalog
+        "--bronze_db" = aws_glue_catalog_database.this["00_bronze"].name
+        "--silver_db" = aws_glue_catalog_database.this["01_silver"].name
+        # Never delete it to "clean up": the next run would reprocess the whole table.
+        "--checkpoint"      = "s3://${aws_s3_bucket.this["lake"].bucket}/_checkpoints/clean_sensor_readings/"
+        "--watermark_table" = aws_dynamodb_table.watermarks.name
       }
     }
     clean_populations = {
@@ -134,5 +148,23 @@ resource "aws_scheduler_schedule" "maintain_tables" {
     arn      = "arn:aws:scheduler:::aws-sdk:glue:startJobRun"
     role_arn = aws_iam_role.scheduler.arn
     input    = jsonencode({ JobName = aws_glue_job.this["maintain_tables"].name })
+  }
+}
+
+# Hourly silver for the live readings, DISABLED until switched on (like the simulator).
+resource "aws_scheduler_schedule" "clean_sensor_readings" {
+  name                         = "clean_sensor_readings"
+  schedule_expression          = "cron(5 * * * ? *)" # every hour at :05
+  schedule_expression_timezone = "UTC"
+  state                        = "DISABLED"
+
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  target {
+    arn      = "arn:aws:scheduler:::aws-sdk:glue:startJobRun"
+    role_arn = aws_iam_role.scheduler.arn
+    input    = jsonencode({ JobName = aws_glue_job.this["clean_sensor_readings"].name })
   }
 }
