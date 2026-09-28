@@ -34,6 +34,7 @@ flowchart LR
     gold --> athena["Athena<br/>SQL"]
 
     ddl["Glue<br/>apply_ddl"] -. versioned migrations .-> lakehouse
+    maintain["Glue<br/>maintain_tables"] -. "compact · expire · orphans" .-> lakehouse
 ```
 
 **Orchestration.** One generic state machine runs once per source, so a failing source never blocks another. Gold rebuilds itself whenever any source succeeds, and any failure sends an email. A backfill runs that same state machine once per date, then gold once.
@@ -112,6 +113,7 @@ When it succeeds, an EventBridge rule starts `gold_pipeline`, which rebuilds `"0
 - Sources and stations are configured in [`config/sources.toml`](config/sources.toml). Table names, raw paths, API requests, the silver job and the default run date are derived from it. A failing source never blocks another.
 - Code is grouped by entity: `src/<NN_layer>/<entity>/` holds the entity's migrations (`ddl_<table>_v<NNN>_<verb>.sql`) and the job that writes it (`glue_job_<process>.py`); processes that serve every source are in `src/00_bronze/_ingestion/`.
 - Tables are created and changed only by those migrations, applied by the `apply_ddl` Glue job and recorded in `ops.schema_migrations`. Jobs check that their output matches the table exactly before writing.
+- The `maintain_tables` Glue job keeps every Iceberg table healthy: it compacts small files (`sort` on sorted tables), rewrites manifests, expires snapshots older than 7 days (keeping the last 5) and removes orphan files older than 3 days, printing files, bytes and snapshots before and after. A weekly schedule is deployed disabled.
 - Pure logic lives in [`src/medallion/`](src/medallion/) and is tested with `pytest` on local PySpark. [CI](.github/workflows/ci.yml) runs the tests and `terraform fmt` / `validate`; deploys are `terraform apply` from a laptop.
 
 ```sh

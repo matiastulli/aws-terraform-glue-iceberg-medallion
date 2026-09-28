@@ -59,6 +59,21 @@ locals {
         "--gold_db"   = aws_glue_catalog_database.this["02_gold"].name
       }
     }
+    maintain_tables = {
+      description = "Compact, expire snapshots and remove orphan files on the Iceberg tables; prints before/after per table"
+      # One at a time: two maintenance runs on one table would only conflict with each other.
+      max_concurrent_runs = 1
+      arguments = {
+        "--catalog"                = local.catalog
+        "--databases"              = join(",", [for db in ["00_bronze", "01_silver", "02_gold", "ops"] : aws_glue_catalog_database.this[db].name])
+        "--tables"                 = "all"
+        "--expire_older_than_days" = "7"
+        "--retain_last"            = "5"
+        "--orphan_older_than_days" = "3"
+        "--rewrite_all"            = "false"
+        "--dry_run"                = "false"
+      }
+    }
     clean_populations = {
       description = "Validate and MERGE one bronze batch (--batch_id) of Wikidata population statements into 01_silver.populations"
       arguments = {
@@ -101,4 +116,23 @@ resource "aws_glue_job" "this" {
     # Changes when the code does, so a new package or script version is a visible job update in the plan.
     "--code-version" = substr(sha1(join("", [data.archive_file.medallion.output_md5, aws_s3_object.glue_script[each.key].etag])), 0, 12)
   })
+}
+
+# Weekly maintenance, DISABLED until switched on: a Scheduler universal target calls glue:StartJobRun directly, no
+# state machine needed for a single job.
+resource "aws_scheduler_schedule" "maintain_tables" {
+  name                         = "maintain_tables"
+  schedule_expression          = "cron(0 8 ? * SUN *)" # Sundays, 08:00 UTC
+  schedule_expression_timezone = "UTC"
+  state                        = "DISABLED"
+
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  target {
+    arn      = "arn:aws:scheduler:::aws-sdk:glue:startJobRun"
+    role_arn = aws_iam_role.scheduler.arn
+    input    = jsonencode({ JobName = aws_glue_job.this["maintain_tables"].name })
+  }
 }

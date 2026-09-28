@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits. Later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–6 done, step 7 next
+**Status:** steps 0–7 done, step 8 next
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -14,8 +14,8 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 4. Gold + data quality | ✅ Done | Daily aggregates with window functions, checks that fail the state machine, and SNS alerts |
 | 5. Backfill | ✅ Done | A Step Functions `Map` state over a date range, safe to rerun |
 | 6. Near real-time | ✅ Done | Simulated live sensors → SQS → Lambda (pyiceberg + pyarrow) → Iceberg, with late and duplicate events (Kinesis isn't available on the Free plan) |
-| 7. Iceberg operations | ⏳ Next | Schema evolution, partition evolution, time travel and rollback, compaction and snapshot expiry, measured with Athena bytes scanned |
-| 8. Governance | | Lake Formation permissions, LF-tags, a column/row filter, and CloudTrail audit |
+| 7. Iceberg operations | ✅ Done | Schema evolution, partition evolution, time travel and rollback, compaction and snapshot expiry, measured with Athena bytes scanned |
+| 8. Governance | ⏳ Next | Lake Formation permissions, LF-tags, a column/row filter, and CloudTrail audit |
 | 9. Spark Structured Streaming | | A Glue job with `trigger(availableNow)` and an S3 checkpoint over landed files, the Auto Loader equivalent, plus a DynamoDB watermark |
 | 10. Complete tests | | The remaining transformations and edge cases |
 
@@ -402,9 +402,56 @@ Verified on AWS:
 
 ## 7. Iceberg operations
 
-- Schema evolution (add, rename and widen columns: Iceberg tracks columns by ID) and partition evolution (`days` → `hours` without rewriting old data), both as `v00N_alter` migrations applied by `apply_ddl`, never ad hoc
-- Time travel and rollback (`rollback_to_snapshot`), `rewrite_data_files`, `expire_snapshots`, `remove_orphan_files`
-- Athena bytes scanned before and after, as the measurement
+**Goal:** keep the tables healthy as they grow (compaction, snapshot expiry, orphan cleanup), change a table's layout without rewriting it by hand, and measure both.
+
+Decisions (with the user, before the code):
+- **Maintenance is our own Glue job**, `maintain_tables`, running Iceberg's Spark procedures with explicit parameters, rather than the Glue Data Catalog's managed table optimizers. Each step is visible and measurable, and the same code runs outside AWS. The managed optimizers go in the notes as the alternative.
+- **The evolution is a partition change:** silver `readings` goes from `days(observed_at)` to `months(observed_at)`. At 72 rows per day the daily partitions are far too small (one ~4 KB file each); a month is closer to a sensible file size. It's a `v002_alter` migration, applied by `apply_ddl`.
+
+Tried locally first (Iceberg 1.10, the real `readings` migration, 10 daily appends):
+- `REPLACE PARTITION FIELD observed_at_day WITH months(observed_at)` is metadata-only: the 10 files keep spec 0 and their `observed_at_day=…` paths. New writes use spec 1.
+- **`rewrite_data_files` with the default `binpack` turned 10 files into 200.** The table has a sort order (`WRITE ORDERED BY`), so the rewrite is range-distributed over `spark.sql.shuffle.partitions` (200). **`strategy => 'sort'` gave 1 file**, and 6.5 KB instead of 40.9 KB, since sorted data compresses better.
+- Files in the old spec are only moved to the new one with `rewrite-all`: by default, a rewrite only picks partitions with at least 5 small files (`min-input-files`), and each old day has 1.
+- `expire_snapshots` needs a literal timestamp (not `current_timestamp()`). With `retain_last => 1` it went from 11 snapshots to 1 and deleted the 10 replaced data files, 10 manifests and 10 manifest lists. Compaction alone frees nothing: the old files stay until the snapshots that use them expire.
+- **`remove_orphan_files` refuses `older_than` under 24 hours**: a file that looks orphaned may belong to a commit still in progress.
+- The `partitions` metadata table fails after the evolution (`Cannot find source column for partition field`); `files` works.
+
+Design:
+- `maintain_tables` (Glue job, `src/ops/_maintenance/`), per table: `rewrite_data_files` (`sort` when the table has a sort order, else `binpack`), `rewrite_manifests`, `expire_snapshots` (older than `--expire_older_than_days`, 7 by default, always keeping `--retain_last`), `remove_orphan_files` (older than `--orphan_older_than_days`, 3 by default, never under 1). It prints files, bytes and snapshots before and after. `--tables` picks tables, default all Iceberg tables in the four databases; `--rewrite_all` for a one-time move to a new partition spec; `--dry_run` for orphans.
+- The SQL for each procedure and the safety limits are pure functions in `medallion/maintenance.py`, tested.
+- A weekly EventBridge Scheduler schedule, deployed DISABLED like the others.
+- **Measured on AWS:** the stream table (99 files for 40 rows) and silver `readings` before and after (files, bytes, snapshots, Athena bytes scanned), plus time travel (`FOR VERSION AS OF`) in Athena **before** expiring the snapshots it needs.
+
+Built:
+- [`medallion/maintenance.py`](../src/medallion/maintenance.py): the four procedure calls, `sort` vs `binpack` from the table's `sort-order` property, UTC timestamp literals for the cutoffs, and `Options` that refuse `retain_last < 1` and orphans younger than a day. 6 tests (68 in total).
+- Glue job [`maintain_tables`](../src/ops/_maintenance/glue_job_maintain_tables.py): lists the Iceberg tables of the four databases (or `--tables`), runs the procedures per table, prints before/after, and fails at the end if any table failed. One run at a time.
+- A weekly schedule (Sundays 08:00 UTC, DISABLED) calling `glue:StartJobRun` through a Scheduler universal target, no state machine.
+- Migration [`ddl_readings_v002_alter.sql`](../src/01_silver/readings/ddl_readings_v002_alter.sql): `REPLACE PARTITION FIELD observed_at_day WITH months(observed_at)`.
+
+Verified on AWS:
+- **Time travel first**, while the snapshots existed: silver `readings` now 720 rows / 10 days; `FOR VERSION AS OF` its 3rd snapshot 216 / 3; `FOR TIMESTAMP AS OF '2026-09-28 00:00 UTC'` (before the backfill) 360 / 5.
+- `apply_ddl` applied `v002_alter`. `maintain_tables` in a demo run (`--rewrite_all true --expire_older_than_days 0 --retain_last 2`), 10 tables in 136 s:
+
+  | Table | Data files | Bytes | Snapshots |
+  |---|---|---|---|
+  | `00_bronze.simulator_readings` | 22 → 1 | 124,153 → 7,549 | 22 → 2 |
+  | `00_bronze.open_meteo_hourly` | 13 → 2 | 124,835 → 24,161 | 13 → 2 |
+  | `01_silver.readings` | 10 → 1 | 55,756 → 10,043 | 10 → 2 |
+  | `ops.schema_migrations` | 10 → 1 | 25,643 → 3,107 | 16 → 2 |
+
+- Athena, the same queries before → after: the stream table by station **4,902 → 354 bytes**; all of silver 2,422 → 1,327; silver's 5-day average **2,269 → 4,101**. Same results each time. Time travel to the 3rd snapshot now fails: `Iceberg snapshot ID does not exists`.
+- No orphan files were found: the ones left by the lost commit races (step 6) are younger than the 3-day cutoff.
+
+**Learned:**
+- **Compaction frees nothing by itself.** A rewrite commits new files, and the old ones stay until no retained snapshot references them. On the stream table `rewrite_manifests` committed too, so the 2 retained snapshots (rewrite, manifests) no longer used the 22 old files and expiry deleted them. On `readings` there were no manifests to rewrite, the retained 2 were the last append and the rewrite, and the append still referenced the 10 daily files: expiry deleted 0 data files.
+- **Expiry is the trade between history and storage:** time travel and rollback reach only the retained snapshots. Expire after the history you need, never before.
+- **Coarser partitions: fewer files, worse pruning.** The 5-day query read 5 of 10 daily files before; after the move to months it reads one file that holds all 10 days, almost twice the bytes. A full scan halved (sorted data compresses better). At real volumes, row-group statistics over the sorted file bring pruning back inside the month; at this size the number of files (S3 requests, planning) matters more than bytes. No layout is free: measure with the real queries.
+- **binpack on a sorted table can multiply files** (10 → 200 locally): the rewrite honours the table's sort order through a range shuffle over `spark.sql.shuffle.partitions`. Use `strategy => 'sort'` on sorted tables.
+- **Partition evolution is metadata-only.** Old files keep their spec and paths, and queries plan over both specs; `rewrite-all` moves them. Iceberg names a partition field after its transform (`observed_at_day`), and `REPLACE PARTITION FIELD` takes that name.
+- **`rewrite_all` belongs with `--tables`:** on every table it also rewrote single-file tables and added a snapshot to each, for nothing. The default (`min-input-files` 2) only compacts where there's something to compact.
+- **`remove_orphan_files` won't take a cutoff under 24 hours,** and the procedures want literal timestamps. Athena's `$files` has no `spec_id` column; Spark's `files` does.
+- **The managed alternative:** the Glue Data Catalog's table optimizers (compaction, snapshot retention, orphan deletion) run the same operations per table without a job, billed per DPU-hour. Our job was chosen to see and measure each step.
+- Not done in this step for time: schema evolution (add or widen a column) and `rollback_to_snapshot`. Both work on the same snapshot mechanics measured here.
 
 ## 8. Governance
 

@@ -118,7 +118,7 @@ resource "aws_iam_role_policy" "step_functions" {
   policy = data.aws_iam_policy_document.step_functions.json
 }
 
-# EventBridge Scheduler: start source_pipeline executions and invoke the sensor simulator, nothing else.
+# EventBridge Scheduler: start source_pipeline executions, invoke the sensor simulator and start table maintenance.
 resource "aws_iam_role" "scheduler" {
   name               = "${var.project}-scheduler"
   assume_role_policy = data.aws_iam_policy_document.assume["scheduler"].json
@@ -132,6 +132,10 @@ data "aws_iam_policy_document" "scheduler" {
   statement {
     actions   = ["lambda:InvokeFunction"]
     resources = [aws_lambda_function.simulate_sensors.arn]
+  }
+  statement {
+    actions   = ["glue:StartJobRun"]
+    resources = [aws_glue_job.this["maintain_tables"].arn]
   }
 }
 
