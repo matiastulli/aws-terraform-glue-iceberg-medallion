@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits. Later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–4 done, step 5 next
+**Status:** steps 0–5 done, step 6 next
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -12,8 +12,8 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 3. Silver | ✅ Done | Typed, deduplicated hourly readings through an idempotent Iceberg `MERGE`, plus a quarantine table |
 | 3b. Second source: population | ✅ Done | City population from Wikidata through the same stack, so gold can show how many people the weather affects |
 | 4. Gold + data quality | ✅ Done | Daily aggregates with window functions, checks that fail the state machine, and SNS alerts |
-| 5. Backfill | ⏳ Next | A Step Functions `Map` state over a date range, safe to rerun |
-| 6. Near real-time | | Simulated live sensors → SQS → Lambda (pyiceberg + pyarrow) → Iceberg, with late and duplicate events (Kinesis isn't available on the Free plan) |
+| 5. Backfill | ✅ Done | A Step Functions `Map` state over a date range, safe to rerun |
+| 6. Near real-time | ⏳ Next | Simulated live sensors → SQS → Lambda (pyiceberg + pyarrow) → Iceberg, with late and duplicate events (Kinesis isn't available on the Free plan) |
 | 7. Iceberg operations | | Schema evolution, partition evolution, time travel and rollback, compaction and snapshot expiry, measured with Athena bytes scanned |
 | 8. Governance | | Lake Formation permissions, LF-tags, a column/row filter, and CloudTrail audit |
 | 9. Spark Structured Streaming | | A Glue job with `trigger(availableNow)` and an S3 checkpoint over landed files, the Auto Loader equivalent, plus a DynamoDB watermark |
@@ -313,7 +313,36 @@ Verified:
 
 ## 5. Backfill
 
-- The state machine takes `start_date` / `end_date`. A `Map` state fans out per date with a small `MaxConcurrency`. Idempotency comes from silver's `MERGE`.
+**Goal:** load a range of past dates for one source with one command, safe to rerun, without a second copy of the pipeline.
+
+Design:
+- **A `backfill` state machine that runs `source_pipeline` once per date** (`states:startExecution.sync:2`, a child execution per date), instead of a date loop inside `source_pipeline`. A date stays one execution = one `_batch_id` = one bronze batch = one silver partition (the Lambda requests each date in UTC). So every date succeeds, fails, alerts and retries on its own, and a backfill adds no code path the daily run doesn't already take.
+- Input `{"source": …, "start_date": …, "end_date": …}`, both inclusive, at most 31 days, so a typo can't start a year of Glue jobs.
+- **JSONata, not JSONPath:** Step Functions has no date arithmetic in JSONPath intrinsics, but JSONata has `$toMillis` / `$fromMillis`. The date list is computed in the state machine, with no extra Lambda.
+- A `Map` state (inline) with `MaxConcurrency` 2, under the Glue jobs' 3 concurrent runs, so the daily schedule still has a slot. Parallel dates MERGE into silver at the same time: the MERGE's `ON` now carries the batch's `observed_at` range, and Iceberg's conflict check for a copy-on-write MERGE uses that filter, so dates that don't overlap shouldn't conflict (to verify on AWS).
+- A failing date doesn't stop the others: it's caught, recorded, and the backfill fails at the end with the list of failed dates. Its child execution has already sent the SNS alert.
+- **Gold once at the end**, not once per date. The EventBridge rule that starts gold after each `source_pipeline` success skips executions named `backfill-*`; the backfill starts `gold_pipeline` itself after the `Map` if at least one date succeeded.
+- Child execution names are `backfill-<date>-<backfill execution name>`, truncated to Step Functions' 80 characters. A name can't be reused for 90 days, and a rerun gets new names, so it gets new batch ids.
+- **Safe to rerun:** the Lambda rewrites the same raw keys, bronze appends the batch again (it's an append-only log, keyed by `_batch_id`), and silver's `MERGE` reports 0 new and 0 changed.
+
+Built:
+- [`backfill.asl.json`](../terraform/state_machines/backfill.asl.json) (JSONata): `CountDays` → `CheckRange` → `RunEachDate` (`Map`, `startExecution.sync:2` per date, a `Catch` that records the date as failed) → `RunGold` if any date succeeded → fail with the failed dates, or succeed with the batch ids.
+- The `gold_after_source` rule gained `"name": [{"anything-but": {"prefix": "backfill-"}}]`, checked with `aws events test-event-pattern` before deploying (a manual name and a UUID match, `backfill-…` doesn't).
+- The Step Functions role can start `source_pipeline` / `gold_pipeline`, describe and stop their executions, and manage the `StepFunctionsGetEventsForStepFunctionsExecutionRule` rule that `.sync` needs.
+- The JSONata expressions were tried first with the `jsonata` npm package (a normal range, one day, February → March, a reversed range), and the definition with `aws stepfunctions validate-state-machine-definition`.
+
+Verified on AWS:
+- **`open_meteo_hourly` 2026-09-15 → 2026-09-19:** succeeded in 11 min 56 s. Every date: 72 input rows, 72 new. 09-15 and 09-16 cleaned at the same time (both started 11:41:25, committed 12 s apart), and **neither MERGE conflicted**. Gold ran **once** (`triggered_by` = the backfill), not five times.
+- **Rerun over 2026-09-18 → 2026-09-20** (overlapping the loaded dates): succeeded in 8 min 39 s, each date **0 new, 0 changed, 72 unchanged**, and silver's latest snapshot didn't change. Gold ran once and published nothing.
+- After both: silver 720 rows (3 stations × 10 days × 24 h) in 10 snapshots, gold 30 rows in 2 snapshots, bronze 13 batches (reruns append, by design). The Athena query that checked all of it scanned 14 KB.
+
+**Learned:**
+- **A backfill should reuse the daily unit of work, not loop inside it.** A child execution per date keeps "one date = one batch = one partition", so retries, alerts and reruns are per date, and there's no second code path to keep correct.
+- **Step Functions JSONata** (`"QueryLanguage": "JSONata"`) replaces `Parameters` / `ResultSelector` / `ResultPath` with `Arguments` / `Output` / `Assign`, and has real functions: `$toMillis` / `$fromMillis` do the date math that JSONPath intrinsics can't. Variables (`Assign`) are visible inside the `Map`'s iterations, so each iteration gets only its date.
+- **`startExecution.sync:2`** waits for the child and returns its output as JSON (`.sync` returns it as a string). It needs `events:PutRule` / `PutTargets` / `DescribeRule` on a rule that Step Functions manages, beyond `states:StartExecution`.
+- **Execution names are unique per state machine for 90 days**, so child names include the parent's name: a rerun gets new names, so new batch ids.
+- **Concurrent Iceberg MERGEs on different days didn't conflict**, because of the bounded `ON`. A copy-on-write MERGE validates at commit (serializable isolation by default) that no file matching its scan filter was added since it started. With the batch's `observed_at` range in the filter, a commit on another day doesn't match, and the MERGE commits on top of it. Without the bound, the filter would be the whole table, and parallel dates would be expected to conflict (not measured).
+- **EventBridge `anything-but` + `prefix`** filters on a field's value, so "every success except backfill children" is one rule, testable offline with `test-event-pattern`.
 
 ## 6. Near real-time
 

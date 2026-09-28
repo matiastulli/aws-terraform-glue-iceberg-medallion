@@ -19,8 +19,20 @@ resource "aws_sfn_state_machine" "gold_pipeline" {
   })
 }
 
+# Backfill one source over a date range: a source_pipeline execution per date, then gold once
+# (state_machines/backfill.asl.json). Started by hand; nothing schedules it.
+resource "aws_sfn_state_machine" "backfill" {
+  name     = "backfill"
+  role_arn = aws_iam_role.step_functions.arn
+  definition = templatefile("${path.module}/state_machines/backfill.asl.json", {
+    source_pipeline = aws_sfn_state_machine.source_pipeline.arn
+    gold_pipeline   = aws_sfn_state_machine.gold_pipeline.arn
+  })
+}
+
 # Event-driven gold: every source_pipeline execution that succeeds starts a gold rebuild. Step Functions publishes
 # execution status changes to the default EventBridge bus by itself. Enabled: it only fires when a source runs.
+# Except backfill's child executions (named backfill-*): the backfill starts gold once after all its dates.
 resource "aws_cloudwatch_event_rule" "gold_after_source" {
   name        = "gold_after_source_pipeline"
   description = "Start gold_pipeline when a source_pipeline execution succeeds"
@@ -30,6 +42,7 @@ resource "aws_cloudwatch_event_rule" "gold_after_source" {
     detail = {
       status          = ["SUCCEEDED"]
       stateMachineArn = [aws_sfn_state_machine.source_pipeline.arn]
+      name            = [{ anything-but = { prefix = "backfill-" } }]
     }
   })
 }

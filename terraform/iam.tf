@@ -89,6 +89,27 @@ data "aws_iam_policy_document" "step_functions" {
     actions   = ["sns:Publish"]
     resources = [aws_sns_topic.alerts.arn]
   }
+  # backfill runs source_pipeline and gold_pipeline as child executions and waits for them (.sync).
+  statement {
+    actions   = ["states:StartExecution"]
+    resources = [for machine in local.child_state_machines : machine.arn]
+  }
+  statement {
+    actions   = ["states:DescribeExecution", "states:StopExecution"]
+    resources = [for machine in local.child_state_machines : "${replace(machine.arn, ":stateMachine:", ":execution:")}:*"]
+  }
+  # .sync waits on child executions through a rule that Step Functions manages in the account.
+  statement {
+    actions   = ["events:PutTargets", "events:PutRule", "events:DescribeRule"]
+    resources = ["arn:aws:events:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"]
+  }
+}
+
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+locals {
+  child_state_machines = [aws_sfn_state_machine.source_pipeline, aws_sfn_state_machine.gold_pipeline]
 }
 
 resource "aws_iam_role_policy" "step_functions" {

@@ -1,0 +1,161 @@
+{
+  "Comment": "Backfill one source over a date range: one source_pipeline execution per date (so one batch per date), then gold once. Input: {\"source\": \"<bronze table>\", \"start_date\": \"YYYY-MM-DD\", \"end_date\": \"YYYY-MM-DD\"}, both inclusive, at most 31 days. JSONata, because JSONPath has no date arithmetic.",
+  "QueryLanguage": "JSONata",
+  "StartAt": "CountDays",
+  "States": {
+    "CountDays": {
+      "Type": "Pass",
+      "Comment": "An invalid date fails here with States.QueryEvaluationError",
+      "Assign": {
+        "source": "{% $states.input.source %}",
+        "start_ms": "{% $toMillis($states.input.start_date & 'T00:00:00Z') %}",
+        "days": "{% ($toMillis($states.input.end_date & 'T00:00:00Z') - $toMillis($states.input.start_date & 'T00:00:00Z')) / 86400000 + 1 %}"
+      },
+      "Next": "CheckRange"
+    },
+    "CheckRange": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": "{% $days >= 1 and $days <= 31 %}",
+          "Next": "RunEachDate"
+        }
+      ],
+      "Default": "InvalidRange"
+    },
+    "InvalidRange": {
+      "Type": "Fail",
+      "Error": "InvalidRange",
+      "Cause": "{% 'end_date must be on or after start_date, and the range at most 31 days; got ' & $string($days) & ' days' %}"
+    },
+    "RunEachDate": {
+      "Type": "Map",
+      "Comment": "Two dates at a time: the Glue jobs allow 3 concurrent runs, so the daily schedule keeps a slot",
+      "Items": "{% [0..$days - 1] %}",
+      "ItemSelector": {
+        "date": "{% $fromMillis($start_ms + $states.context.Map.Item.Value * 86400000, '[Y0001]-[M01]-[D01]') %}"
+      },
+      "MaxConcurrency": 2,
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "RunSourcePipeline",
+        "States": {
+          "RunSourcePipeline": {
+            "Type": "Task",
+            "Comment": "The child's name becomes the date's _batch_id. The backfill- prefix keeps the gold_after_source rule from starting gold per date",
+            "Resource": "arn:aws:states:::states:startExecution.sync:2",
+            "Arguments": {
+              "StateMachineArn": "${source_pipeline}",
+              "Name": "{% $substring('backfill-' & $states.input.date & '-' & $states.context.Execution.Name, 0, 80) %}",
+              "Input": {
+                "source": "{% $source %}",
+                "date": "{% $states.input.date %}"
+              }
+            },
+            "Output": {
+              "date": "{% $states.input.date %}",
+              "status": "succeeded",
+              "batch_id": "{% $states.result.Name %}"
+            },
+            "Retry": [
+              {
+                "Comment": "Only a refused start. A failed child isn't retried: it already alerted, and a rerun of the backfill covers it",
+                "ErrorEquals": [
+                  "StepFunctions.ExecutionLimitExceededException"
+                ],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "Comment": "A failing date doesn't stop the others; the backfill fails at the end with the list",
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Output": {
+                  "date": "{% $states.input.date %}",
+                  "status": "failed",
+                  "error": "{% $states.errorOutput.Error %}"
+                },
+                "Next": "DateFailed"
+              }
+            ],
+            "End": true
+          },
+          "DateFailed": {
+            "Type": "Pass",
+            "End": true
+          }
+        }
+      },
+      "Assign": {
+        "results": "{% $states.result %}"
+      },
+      "Next": "AnyDateSucceeded"
+    },
+    "AnyDateSucceeded": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": "{% 'succeeded' in $results.status %}",
+          "Next": "RunGold"
+        }
+      ],
+      "Default": "AnyDateFailed"
+    },
+    "RunGold": {
+      "Type": "Task",
+      "Comment": "Once for the whole range, instead of once per date",
+      "Resource": "arn:aws:states:::states:startExecution.sync:2",
+      "Arguments": {
+        "StateMachineArn": "${gold_pipeline}",
+        "Input": {
+          "triggered_by": "{% $states.context.Execution.Name %}"
+        }
+      },
+      "Output": "{% $states.input %}",
+      "Catch": [
+        {
+          "Comment": "gold_pipeline has already sent the alert",
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "GoldFailed"
+        }
+      ],
+      "Next": "AnyDateFailed"
+    },
+    "GoldFailed": {
+      "Type": "Fail",
+      "Error": "GoldFailed",
+      "Cause": "{% 'The dates loaded, but gold_pipeline failed: ' & $states.input.Error %}"
+    },
+    "AnyDateFailed": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": "{% 'failed' in $results.status %}",
+          "Next": "BackfillIncomplete"
+        }
+      ],
+      "Default": "Done"
+    },
+    "BackfillIncomplete": {
+      "Type": "Fail",
+      "Error": "BackfillIncomplete",
+      "Cause": "{% 'Failed dates (rerun the backfill for them): ' & $join($results[status = 'failed'].date, ', ') %}"
+    },
+    "Done": {
+      "Type": "Succeed",
+      "Output": {
+        "source": "{% $source %}",
+        "dates": "{% $count($results) %}",
+        "batch_ids": "{% $results.batch_id %}"
+      }
+    }
+  }
+}

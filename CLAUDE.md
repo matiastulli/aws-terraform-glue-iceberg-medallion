@@ -42,7 +42,8 @@ Deploy and run (CD from the laptop; deploy order is `terraform apply` → `apply
 export JAVA_HOME=$(/usr/libexec/java_home -v 17); .venv/bin/pytest          # pure logic on local PySpark (pyproject sets pythonpath=src)
 aws glue start-job-run --job-name apply_ddl --arguments '{"--dry_run":"true"}'   # list pending migrations; without the argument, apply them
 aws stepfunctions start-execution --state-machine-arn <source_pipeline ARN> --name <source>-<date>-a --input '{"source":"open_meteo_hourly","date":"2026-09-20"}'   # one source per execution; date optional (default: today - lag_days); the name becomes _batch_id
-aws stepfunctions start-execution --state-machine-arn <gold_pipeline ARN> --input '{"triggered_by":"manual"}'   # also starts by itself when any source_pipeline succeeds (EventBridge rule)
+aws stepfunctions start-execution --state-machine-arn <backfill ARN> --name <source>-<start>-<end>-a --input '{"source":"open_meteo_hourly","start_date":"2026-09-15","end_date":"2026-09-19"}'   # one source_pipeline per date (2 at a time, ≤ 31 days), then gold once
+aws stepfunctions start-execution --state-machine-arn <gold_pipeline ARN> --input '{"triggered_by":"manual"}'   # also starts by itself when a source_pipeline execution not named backfill-* succeeds (EventBridge rule)
 aws scheduler update-schedule ...                                           # schedules source_pipeline-<source> are deployed DISABLED; enable one on purpose
 aws glue start-job-run --job-name clean_readings --arguments '{"--batch_id":"<execution name>"}'   # re-clean one bronze batch; a rerun must report new: 0, changed: 0
 aws glue get-job-run --job-name load_raw_files --run-id <id>                 # job stdout is in CloudWatch /aws-glue/jobs/output/<run id>

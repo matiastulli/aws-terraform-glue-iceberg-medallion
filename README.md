@@ -31,18 +31,20 @@ flowchart LR
     ddl["Glue<br/>apply_ddl"] -. versioned migrations .-> lakehouse
 ```
 
-**Orchestration.** One generic state machine runs once per source, so a failing source never blocks another. Gold rebuilds itself whenever any source succeeds, and any failure sends an email.
+**Orchestration.** One generic state machine runs once per source, so a failing source never blocks another. Gold rebuilds itself whenever any source succeeds, and any failure sends an email. A backfill runs that same state machine once per date, then gold once.
 
 ```mermaid
 flowchart LR
     sched["EventBridge Scheduler<br/>one schedule per source"] -- "{source}" --> sp
+    bf["Step Functions: backfill<br/>Map over a date range"] -- "{source, date}<br/>2 dates at a time" --> sp
+    bf -- "once, at the end" --> gp
 
     subgraph sp["Step Functions: source_pipeline (one execution per source)"]
         direction LR
         i["Ingest<br/>Lambda"] --> l["Load<br/>Glue"] --> c["Clean<br/>Glue silver_job"]
     end
 
-    sp -- succeeded --> rule["EventBridge rule"] --> gp
+    sp -- "succeeded<br/>(not backfill-*)" --> rule["EventBridge rule"] --> gp
 
     subgraph gp["Step Functions: gold_pipeline"]
         b["Build<br/>Glue build_reading_metrics"]
@@ -96,6 +98,8 @@ Each `source_pipeline` execution takes `{"source": "<bronze table>", "date": "YY
 
 When it succeeds, an EventBridge rule starts `gold_pipeline`, which rebuilds `"02_gold".agg_readings_daily` in the order compute → data quality checks → write. It writes only if every check passes and something changed. Schedules (EventBridge Scheduler, one per source) are deployed disabled; failures go to the SNS topic `weather-lakehouse-alerts`.
 
+**Backfill:** the `backfill` state machine takes `{"source": …, "start_date": …, "end_date": …}` (inclusive, at most 31 days) and starts one `source_pipeline` execution per date, two at a time, so every date is its own batch that fails and alerts on its own. It then runs `gold_pipeline` once; its per-date executions are named `backfill-<date>-…`, which the EventBridge rule skips. A rerun is safe: silver's `MERGE` reports 0 new and 0 changed rows.
+
 `"02_gold".agg_readings_daily` has one row per station and day: temperature min/max/avg, a 7-day rolling average and the change vs the previous day, humidity, rain, max wind, and the city's population as of that day (the latest Wikidata count on or before it).
 
 - Sources and stations are configured in [`config/sources.toml`](config/sources.toml). Table names, raw paths, API requests, the silver job and the default run date are derived from it. A failing source never blocks another.
@@ -109,6 +113,7 @@ terraform -chdir=terraform plan -out=tfplan && terraform -chdir=terraform apply 
 aws glue start-job-run --job-name apply_ddl
 aws stepfunctions start-execution --state-machine-arn <source_pipeline ARN> --name open_meteo_hourly-2026-09-20-a --input '{"source":"open_meteo_hourly","date":"2026-09-20"}'
 aws stepfunctions start-execution --state-machine-arn <source_pipeline ARN> --name wikidata_population-2026-09-27-a --input '{"source":"wikidata_population"}'
+aws stepfunctions start-execution --state-machine-arn <backfill ARN> --name open_meteo_hourly-2026-09-15-2026-09-19-a --input '{"source":"open_meteo_hourly","start_date":"2026-09-15","end_date":"2026-09-19"}'
 ```
 
 Query in Athena (workgroup `weather-lakehouse`). The numbered databases need double quotes in queries:
