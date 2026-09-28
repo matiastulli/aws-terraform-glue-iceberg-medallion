@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits. Later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–7 done, step 8 next
+**Status:** steps 0–8 done, step 9 next
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -15,8 +15,8 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 5. Backfill | ✅ Done | A Step Functions `Map` state over a date range, safe to rerun |
 | 6. Near real-time | ✅ Done | Simulated live sensors → SQS → Lambda (pyiceberg + pyarrow) → Iceberg, with late and duplicate events (Kinesis isn't available on the Free plan) |
 | 7. Iceberg operations | ✅ Done | Schema evolution, partition evolution, time travel and rollback, compaction and snapshot expiry, measured with Athena bytes scanned |
-| 8. Governance | ⏳ Next | Lake Formation permissions, LF-tags, a column/row filter, and CloudTrail audit |
-| 9. Spark Structured Streaming | | A Glue job with `trigger(availableNow)` and an S3 checkpoint over landed files, the Auto Loader equivalent, plus a DynamoDB watermark |
+| 8. Governance | ✅ Done | Lake Formation permissions, LF-tags, a column/row filter, and CloudTrail audit |
+| 9. Spark Structured Streaming | ⏳ Next | A Glue job with `trigger(availableNow)` and an S3 checkpoint over landed files, the Auto Loader equivalent, plus a DynamoDB watermark |
 | 10. Complete tests | | The remaining transformations and edge cases |
 
 **Timebox:** the interview is on 2026-09-29, two days after step 0. Steps 1–4 are day 1 and steps 5–8 are day 2. Anything that doesn't fit stays planned here.
@@ -455,7 +455,47 @@ Verified on AWS:
 
 ## 8. Governance
 
-- Lake Formation: register the lake location, an `analyst` role that can read gold only, an LF-tag, a column filter, and CloudTrail for the audit trail
+**Goal:** an analyst who can read gold, and only the part of it they're allowed to, enforced by Lake Formation and audited, without touching the pipeline.
+
+Found before the design (read-only): Lake Formation in its IAM-compatibility default. No admins, no registered locations, no LF-tags, and every database and table grants `ALL` to `IAM_ALLOWED_PRINCIPALS`, so IAM alone decides. No CloudTrail trail; the 90-day event history is free and is enough to audit.
+
+Decisions (with the user, before the code):
+- **Only gold is governed.** Bronze and silver stay on IAM, so the jobs that write them don't change.
+- **One data cells filter with both kinds of restriction:** the analyst doesn't see the `population` column, and sees only `buenos_aires` and `cordoba`.
+- **The analyst is an IAM role the user assumes** (`sts assume-role`, temporary credentials), not an IAM user with access keys.
+
+Design:
+- **Hybrid access mode.** Gold's S3 location (`s3://<lake>/02_gold`) is registered with `hybrid_access_enabled`, and only the analyst role is **opted in** on gold. Opted-in principals get Lake Formation permissions; everyone else (the Glue jobs, the Terraform user) keeps IAM + `IAM_ALLOWED_PRINCIPALS` as today. Full mode (revoking `IAM_ALLOWED_PRINCIPALS`) would need Lake Formation grants for every job that touches gold, and Terraform has no clean way to revoke a grant it didn't create. Hybrid is AWS's path for moving a lake over principal by principal, and the whole setup stays in Terraform.
+- **Data lake settings** in Terraform: the Terraform user as data lake admin (grants need an admin), and the current defaults kept explicitly (`IAM_ALLOWED_PRINCIPALS` on new databases and tables, the existing parameters), so `apply_ddl`'s next table behaves as before.
+- **An LF-tag** `layer` (`bronze`, `silver`, `gold`), with `gold` on the `02_gold` database; its tables inherit it. The analyst gets `DESCRIBE` on everything tagged `layer=gold` (tag-based access: a new gold table is visible without a new grant) and `SELECT` only through the data cells filter on `agg_readings_daily`.
+- **The analyst role:** Athena on the `weather-lakehouse` workgroup, Glue catalog reads on `02_gold`, `lakeformation:GetDataAccess` (Lake Formation hands out the S3 credentials, scoped to what it allows), and the Athena results bucket. No S3 access to the lake: data only reaches the analyst through Lake Formation.
+- **Verified on AWS:** as the analyst, gold shows 2 stations and no `population`, and silver is denied; as the Terraform user, gold is unchanged; `gold_pipeline` and `maintain_tables` still run; CloudTrail event history shows the analyst's queries and Lake Formation's `GetDataAccess`.
+
+Built:
+- [`terraform/lakeformation.tf`](../terraform/lakeformation.tf): data lake settings (the Terraform user as admin, the defaults kept), gold's location registered in hybrid mode with the service-linked role, the `layer` LF-tag on `02_gold`, the analyst role and its IAM policy, the data cells filter `analyst_mainland_without_population`, `DESCRIBE` by tag, `SELECT` through the filter, and the opt-in. The analyst role's ARN is a sensitive output.
+
+Verified on AWS (queries in the `weather-lakehouse` workgroup):
+- **As the Terraform user:** gold unchanged, 3 stations × 10 days with their population.
+- **As the analyst** (`sts assume-role`):
+
+  | Query | Result |
+  |---|---|
+  | `SELECT *` | every column except `population`: the column isn't there, not null |
+  | per station | `buenos_aires` and `cordoba`, 10 days each; `ushuaia` doesn't exist for them |
+  | `SELECT population` | `COLUMN_NOT_FOUND: … cannot be resolved or requester is not authorized` |
+  | silver | denied by IAM: no `glue:GetDatabase` on `01_silver` |
+  | the lake's S3 | `AccessDenied` on `ListObjectsV2` |
+
+- `gold_pipeline` still ran (build 72 s), with the Glue job on IAM as before.
+- **CloudTrail event history** (no trail needed) for the analyst's session: `StartQueryExecution`, `GetTable`, `GetDataAccess` and the denied `GetDatabase`. A `GetDataAccess` event names the table, the permission (`SELECT`), the requesting service (`ATHENA`), the Athena query id and `cellLevelSecurityEnforced: true`.
+
+**Learned:**
+- **Two layers of permission.** IAM decides which APIs a principal may call (silver was denied there); Lake Formation decides what data those calls return (gold's rows and columns). Lake Formation doesn't give S3 access: it vends temporary credentials scoped to the table, so the analyst needs no S3 permission on the lake, and must have none, or IAM would bypass Lake Formation.
+- **A hidden column is absent, not null,** and asking for it fails like a column that doesn't exist, so the error doesn't reveal that it's there.
+- **Hybrid access mode** moves a lake to Lake Formation principal by principal: opted-in principals get Lake Formation permissions, the rest keep `IAM_ALLOWED_PRINCIPALS`. Full mode means revoking `IAM_ALLOWED_PRINCIPALS` and granting every job explicitly.
+- **LF-tags scale grants:** a grant on `layer=gold` covers every current and future gold table; a data cells filter is per table, so fine-grained access is still granted table by table.
+- **`aws_lakeformation_data_lake_settings` replaces the account's settings,** so the defaults (`IAM_ALLOWED_PRINCIPALS` on new databases and tables) must be written out, or the next table `apply_ddl` creates would be invisible to the jobs.
+- **Terraform: a plan file goes stale** as soon as anything changes the state, even a plan run for a check. `aws_lakeformation_opt_in` planned a replacement on every run until `catalog_id` was set explicitly: AWS stores it, and a value the code leaves out looks like a change.
 
 ## 9. Spark Structured Streaming
 
