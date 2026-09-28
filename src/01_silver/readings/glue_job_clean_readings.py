@@ -19,6 +19,8 @@ from pyspark.sql.utils import AnalysisException
 from medallion import readings as entity
 from medallion.contract import raise_if_schema_mismatch
 from medallion.silver import (
+    batch_bounds,
+    between_sql,
     change_counts,
     classify_changes,
     dedup_latest,
@@ -53,9 +55,12 @@ updates, rejects = entity.to_silver(unique), entity.to_quarantine(rejected)
 raise_if_schema_mismatch(updates.dtypes, silver.dtypes, silver_table)
 raise_if_schema_mismatch(rejects.dtypes, quarantine.dtypes, quarantine_table)
 
+# silver is read only within the batch's observed_at range (a match can't be outside it), and the MERGE's ON gets the
+# same literal range so Iceberg prunes to those days: both stay the size of the batch, not of the table's history.
+bounds = batch_bounds(updates, "observed_at")
 # Only new and changed rows reach the MERGE, and an empty MERGE is skipped: with copy-on-write, a matched key rewrites
 # its whole data file even when nothing changes (docs/PLAN.md step 3).
-classified = classify_changes(updates, silver, entity.KEY, entity.MEASURES).cache()
+classified = classify_changes(updates, silver.where(between_sql("observed_at", bounds)), entity.KEY, entity.MEASURES).cache()
 counts |= change_counts(classified)
 to_quarantine = new_rejects(rejects, quarantine, entity.QUARANTINE_MATCH).cache()
 counts["quarantined_now"] = to_quarantine.count()
@@ -64,7 +69,7 @@ counts["quarantined_now"] = to_quarantine.count()
 rows_to_merge(classified).createOrReplaceTempView("clean_readings_updates")
 to_quarantine.createOrReplaceTempView("clean_readings_rejects")
 if counts["new"] + counts["changed"]:
-    spark.sql(merge_sql(silver_table, "clean_readings_updates", entity.KEY, entity.MEASURES))
+    spark.sql(merge_sql(silver_table, "clean_readings_updates", entity.KEY, entity.MEASURES, between_sql("t.observed_at", bounds)))
 if counts["quarantined_now"]:
     spark.sql(quarantine_merge_sql(quarantine_table, "clean_readings_rejects", entity.QUARANTINE_MATCH))
 

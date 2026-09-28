@@ -4,7 +4,7 @@ import pytest
 from pyspark.sql import functions as F
 
 from medallion.readings import KEY, MEASURES, add_observed_at, add_rejection_reasons, flatten_hourly, to_silver
-from medallion.silver import change_counts, classify_changes, dedup_latest, reconcile, rows_to_merge, split_valid_and_rejected
+from medallion.silver import batch_bounds, between_sql, change_counts, classify_changes, dedup_latest, merge_sql, reconcile, rows_to_merge, split_valid_and_rejected
 
 BRONZE_SCHEMA = """
     utc_offset_seconds int,
@@ -136,3 +136,24 @@ def test_only_new_and_changed_rows_reach_the_merge(spark):
     assert merged.columns == updates.columns
     assert sorted(r.temperature_c for r in merged.collect()) == [16.5, 17.0]
     assert rows_to_merge(classify_changes(current, current, KEY, MEASURES)).count() == 0
+
+
+def test_silver_is_bounded_to_the_batch_range_without_losing_a_match(spark):
+    # A match can only be inside the batch's observed_at range, so bounding silver changes no classification.
+    history = readings(spark, bronze_row(["2026-09-18T23:00", "2026-09-20T00:00", "2026-09-20T01:00", "2026-09-21T00:00"], [9.0, 15.0, 16.0, 11.0]))
+    current = to_silver(dedup_latest_(split_valid_and_rejected(history)))
+    batch = readings(spark, bronze_row(["2026-09-20T00:00", "2026-09-20T01:00", "2026-09-20T02:00"], [15.0, 16.5, 17.0], ingested=INGESTED + dt.timedelta(hours=1)))
+    updates = to_silver(dedup_latest_(split_valid_and_rejected(batch)))
+
+    bounds = batch_bounds(updates, "observed_at")
+    bounded = current.where(between_sql("observed_at", bounds))
+
+    assert bounds == ("CAST('2026-09-20 00:00:00' AS TIMESTAMP)", "CAST('2026-09-20 02:00:00' AS TIMESTAMP)")
+    assert sorted(r.temperature_c for r in bounded.collect()) == [15.0, 16.0]
+    assert change_counts(classify_changes(updates, bounded, KEY, MEASURES)) == change_counts(classify_changes(updates, current, KEY, MEASURES))
+    assert merge_sql("t_silver", "v", KEY, MEASURES, between_sql("t.observed_at", bounds)).splitlines()[2] == (
+        "ON t.station_id = s.station_id AND t.observed_at = s.observed_at AND t.observed_at BETWEEN "
+        "CAST('2026-09-20 00:00:00' AS TIMESTAMP) AND CAST('2026-09-20 02:00:00' AS TIMESTAMP)"
+    )
+    # An empty batch has nothing to match: FALSE, not an unbounded read of silver.
+    assert between_sql("observed_at", batch_bounds(updates.limit(0), "observed_at")) == "FALSE"

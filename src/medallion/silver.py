@@ -6,6 +6,7 @@ An entity module (readings.py, populations.py) flattens and validates its bronze
     split_valid_and_rejected -> every row on exactly one side
     dedup_latest             -> one row per key, with a deterministic winner
     reconcile                -> every input row accounted for, or the job fails before writing
+    batch_bounds / between_sql -> bound silver to the batch's key range, so reading it doesn't grow with its history
     classify_changes         -> new / changed / unchanged against the silver table
     rows_to_merge            -> only new and changed rows reach the MERGE (see classify_changes for why)
     merge_sql / quarantine_merge_sql -> the MERGE statements, which the Glue job runs
@@ -58,6 +59,24 @@ def reconcile(input_rows: int, valid_rows: int, rejected_rows: int, unique_rows:
     return counts
 
 
+def batch_bounds(updates: DataFrame, column: str) -> tuple[str, str] | None:
+    """The batch's min and max of a key column, as SQL literals of the column's type; None when the batch is empty.
+
+    silver can only match a key the batch holds, so filtering silver to this range changes no result, and it keeps
+    the classify_changes read and the MERGE's target scan to the batch's partitions instead of the whole history.
+    The bounds must be literals: Spark and Iceberg prune files on constant filters, not on values that come from the
+    other side of a join. Casting to string and back runs in the session time zone, so a timestamp round-trips exactly.
+    """
+    sql_type = updates.schema[column].dataType.simpleString().upper()
+    low, high = updates.agg(F.min(column).cast("string"), F.max(column).cast("string")).first()
+    return None if low is None else (f"CAST('{low}' AS {sql_type})", f"CAST('{high}' AS {sql_type})")
+
+
+def between_sql(column: str, bounds: tuple[str, str] | None) -> str:
+    """`column BETWEEN low AND high`; FALSE for an empty batch, which has nothing to match."""
+    return "FALSE" if bounds is None else f"{column} BETWEEN {bounds[0]} AND {bounds[1]}"
+
+
 def classify_changes(updates: DataFrame, current: DataFrame, key: Sequence[str], values: Sequence[str]) -> DataFrame:
     """Adds `change`: `new` (key not in silver), `changed` (different values, from data at least as recent), or
     `unchanged` (same values, or older data that must not overwrite newer).
@@ -88,11 +107,14 @@ def rows_to_merge(classified: DataFrame) -> DataFrame:
     return classified.where(F.col("change") != "unchanged").drop("change")
 
 
-def merge_sql(table: str, source_view: str, key: Sequence[str], values: Sequence[str]) -> str:
+def merge_sql(table: str, source_view: str, key: Sequence[str], values: Sequence[str], target_filter: str | None = None) -> str:
     """MERGE on the key: insert new keys; update a match only when its values differ and the incoming data isn't
     older, so a late backfill can't overwrite newer data. The conditions repeat classify_changes, so the statement
-    stays correct on its own (e.g. if another writer committed in between)."""
-    on = " AND ".join(f"t.{k} = s.{k}" for k in key)
+    stays correct on its own (e.g. if another writer committed in between).
+
+    `target_filter` (a predicate on `t.` with literal values, see batch_bounds) is added to ON, where Iceberg pushes
+    it into the target scan: without it the MERGE reads every data file of the table to look for matches."""
+    on = " AND ".join([*(f"t.{k} = s.{k}" for k in key), *([target_filter] if target_filter else [])])
     values_differ = " OR ".join(f"NOT (t.{c} <=> s.{c})" for c in values)
     return (
         f"MERGE INTO {table} t\nUSING {source_view} s\nON {on}\n"
