@@ -24,6 +24,15 @@ api_url = "https://query.wikidata.org/sparql"
 silver_job = "clean_populations"
 lag_days = 0  # the current state of Wikidata
 
+# Live readings (step 6): a simulator Lambda sends them to an SQS queue every minute, and a consumer Lambda appends them
+# to the bronze table <system>_<table> (simulator_readings). The rates make the stream behave like real sensors.
+[[streams]]
+system = "simulator"
+table = "readings"
+duplicate_rate = 0.1   # sent twice with the same event_id, as a sensor retrying
+late_rate = 0.1        # sent up to max_late_minutes after observed_at, as a sensor that buffered while offline
+max_late_minutes = 90
+
 [[stations]]
 station_id = "buenos_aires"
 name = "Buenos Aires"

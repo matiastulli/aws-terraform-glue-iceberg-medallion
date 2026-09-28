@@ -1,4 +1,4 @@
-"""config/sources.toml: the bronze sources and the stations they are read for.
+"""config/sources.toml: the bronze sources, the streams, and the stations they are read for.
 
 Names are derived, never configured: a source's bronze table and raw prefix come from its `system` and `table`, and
 its `kind` says how to ask the API for one station (build_request). No pyspark here: the ingest Lambda imports this.
@@ -44,6 +44,21 @@ class Source:
 
 
 @dataclass(frozen=True)
+class Stream:
+    """A live source: messages arrive on a queue and are appended to bronze as they come (docs/PLAN.md step 6)."""
+
+    system: str
+    table: str
+    duplicate_rate: float  # simulator: share of readings sent twice, like a sensor retrying
+    late_rate: float  # simulator: share of readings sent late, like a sensor that buffered while offline
+    max_late_minutes: int
+
+    @property
+    def bronze_table(self) -> str:
+        return f"{self.system}_{self.table}"
+
+
+@dataclass(frozen=True)
 class Station:
     station_id: str
     name: str
@@ -56,12 +71,19 @@ class Station:
 class Config:
     sources: tuple[Source, ...]
     stations: tuple[Station, ...]
+    streams: tuple[Stream, ...] = ()
 
     def source(self, bronze_table: str) -> Source:
         for source in self.sources:
             if source.bronze_table == bronze_table:
                 return source
         raise ValueError(f"no source {bronze_table!r} in config; known: {[s.bronze_table for s in self.sources]}")
+
+    def stream(self, bronze_table: str) -> Stream:
+        for stream in self.streams:
+            if stream.bronze_table == bronze_table:
+                return stream
+        raise ValueError(f"no stream {bronze_table!r} in config; known: {[s.bronze_table for s in self.streams]}")
 
 
 def parse_config(text: str) -> Config:
@@ -71,6 +93,10 @@ def parse_config(text: str) -> Config:
     sources = tuple(
         Source(s["system"], s["table"], s["kind"], s["api_url"], s["silver_job"], int(s["lag_days"]), tuple(s.get("variables", [])))
         for s in data.get("sources", [])
+    )
+    streams = tuple(
+        Stream(s["system"], s["table"], float(s["duplicate_rate"]), float(s["late_rate"]), int(s["max_late_minutes"]))
+        for s in data.get("streams", [])
     )
     stations = tuple(
         Station(s["station_id"], s["name"], float(s["latitude"]), float(s["longitude"]), s.get("wikidata_id"))
@@ -94,17 +120,25 @@ def parse_config(text: str) -> Config:
             for station in stations:
                 if not WIKIDATA_ID.match(station.wikidata_id or ""):
                     problems.append(f"station {station.station_id} needs a wikidata_id like Q1486 for source {source.bronze_table}")
+    for stream in streams:
+        for field, value in (("system", stream.system), ("table", stream.table)):
+            if not NAME.match(value):
+                problems.append(f"stream {field} {value!r} must match {NAME.pattern}")
+        if not (0 <= stream.duplicate_rate <= 1 and 0 <= stream.late_rate <= 1):
+            problems.append(f"stream {stream.bronze_table} rates must be between 0 and 1")
+        if stream.max_late_minutes < 1:
+            problems.append(f"stream {stream.bronze_table} max_late_minutes must be at least 1")
     for station in stations:
         if not NAME.match(station.station_id):
             problems.append(f"station_id {station.station_id!r} must match {NAME.pattern}")
         if not (-90 <= station.latitude <= 90 and -180 <= station.longitude <= 180):
             problems.append(f"station {station.station_id} has an impossible position")
-    for kind, names in (("bronze table", [s.bronze_table for s in sources]), ("station_id", [s.station_id for s in stations])):
+    for kind, names in (("bronze table", [s.bronze_table for s in (*sources, *streams)]), ("station_id", [s.station_id for s in stations])):
         if duplicates := sorted({n for n in names if names.count(n) > 1}):
             problems.append(f"duplicate {kind}: {duplicates}")
     if problems:
         raise ValueError("invalid config/sources.toml:\n  " + "\n  ".join(problems))
-    return Config(sources, stations)
+    return Config(sources, stations, streams)
 
 
 def raw_prefix(source: Source, date: dt.date) -> str:

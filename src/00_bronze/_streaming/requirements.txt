@@ -1,0 +1,7 @@
+# The consume_sensor_readings Lambda layer (scripts/build_pyiceberg_layer.sh). pyiceberg-core (Rust) computes the
+# partition transforms on write: without it, appending to a days(...)-partitioned table raises NotInstalledError.
+# pyarrow is pinned to 20.0.0, the last release with manylinux2014 wheels: the python3.11 Lambda runtime runs on Amazon
+# Linux 2 (glibc 2.26), and later wheels need glibc 2.28. The public AWS SDK for pandas layer isn't an option: its
+# pyarrow is built without S3 support (no pyarrow._s3fs), which pyiceberg's PyArrowFileIO needs.
+pyiceberg[glue,pyarrow,pyiceberg-core]==0.12.0
+pyarrow==20.0.0

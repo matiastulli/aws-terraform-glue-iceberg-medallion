@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits. Later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–5 done, step 6 next
+**Status:** steps 0–6 done, step 7 next
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -13,8 +13,8 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 3b. Second source: population | ✅ Done | City population from Wikidata through the same stack, so gold can show how many people the weather affects |
 | 4. Gold + data quality | ✅ Done | Daily aggregates with window functions, checks that fail the state machine, and SNS alerts |
 | 5. Backfill | ✅ Done | A Step Functions `Map` state over a date range, safe to rerun |
-| 6. Near real-time | ⏳ Next | Simulated live sensors → SQS → Lambda (pyiceberg + pyarrow) → Iceberg, with late and duplicate events (Kinesis isn't available on the Free plan) |
-| 7. Iceberg operations | | Schema evolution, partition evolution, time travel and rollback, compaction and snapshot expiry, measured with Athena bytes scanned |
+| 6. Near real-time | ✅ Done | Simulated live sensors → SQS → Lambda (pyiceberg + pyarrow) → Iceberg, with late and duplicate events (Kinesis isn't available on the Free plan) |
+| 7. Iceberg operations | ⏳ Next | Schema evolution, partition evolution, time travel and rollback, compaction and snapshot expiry, measured with Athena bytes scanned |
 | 8. Governance | | Lake Formation permissions, LF-tags, a column/row filter, and CloudTrail audit |
 | 9. Spark Structured Streaming | | A Glue job with `trigger(availableNow)` and an S3 checkpoint over landed files, the Auto Loader equivalent, plus a DynamoDB watermark |
 | 10. Complete tests | | The remaining transformations and edge cases |
@@ -346,13 +346,59 @@ Verified on AWS:
 
 ## 6. Near real-time
 
-Kinesis, Firehose and MSK are blocked on the Free plan, so the stream is SQS:
+**Goal:** simulated live sensor readings flow continuously into a bronze Iceberg table, with the duplicates and late events a real stream has, without Spark and without Kinesis (blocked on the Free plan).
 
-- Simulator Lambda (on an EventBridge schedule) → SQS queue → consumer Lambda (event source mapping, batch size + batching window) → append to a bronze table named from config like any source (e.g. `simulator_readings`), created by a migration, with **pyiceberg + pyarrow** against the Glue catalog, no Spark
-- `ReportBatchItemFailures` for partial batch failures, a dead-letter queue after N receives, and an alarm on DLQ depth
-- SQS standard queues are at-least-once and unordered, so duplicates and out-of-order readings reach bronze. Silver's `MERGE` on `(station_id, observed_at)` already absorbs them. That's the same contract as Kinesis, and the notes compare the two (shards, partition keys, ordering, replay, iterator age).
-- The consumer checks the table's schema contract before appending, like the Spark jobs (pyiceberg must also handle the quoted `00_bronze`: verify).
-- Lambda micro-batches make small files in Iceberg, which is the reason for the compaction in step 7.
+Decisions (with the user, before the code):
+- **Step 6 ends in bronze.** Live readings share silver's key `(station_id, observed_at)` with Open-Meteo, so putting both in `readings` needs a precedence rule. Moving them to silver is step 9's job (Structured Streaming over this table).
+- **The simulator runs every minute, deployed DISABLED**, like the source schedules. It's switched on for a test and off again.
+
+Design:
+- `simulate_sensors` (Lambda, EventBridge Scheduler every minute) → SQS standard queue → `consume_sensor_readings` (Lambda, SQS event source mapping) → `"00_bronze".simulator_readings`.
+- **Config:** a `[[streams]]` entry in `config/sources.toml` (`system = "simulator"`, `table = "readings"`), so the table name is derived like a source's. The duplicate and late rates live there too.
+- **The simulator** sends one reading per station per minute (`observed_at` at the minute), and on purpose resends some (the same `event_id`, as a sensor retrying) and sends some late (`observed_at` up to 90 minutes old, as a sensor that buffered while offline). SQS standard adds its own duplicates and reordering.
+- **Bronze `simulator_readings`:** the message fields as sent (`event_id`, `station_id`, `observed_at`, the measures), plus `_message_id` (SQS), `_sent_at` (when SQS received it), `_batch_id` (the Lambda invocation) and `_ingested_at`. Partitioned by `days(_ingested_at)` like the other bronze tables, created by a migration applied by `apply_ddl`.
+- **The consumer writes with pyiceberg + pyarrow, no Spark.** One `append` (one Iceberg commit) per Lambda batch. It checks the table's schema contract before appending, like the Spark jobs.
+  - Verified before the design (read-only): pyiceberg 0.12 loads `("00_bronze", "open_meteo_hourly")` from the Glue catalog, and the dotted `"00_bronze.open_meteo_hourly"` works too. Spark `TIMESTAMP` columns are Iceberg `timestamptz`, so the consumer writes UTC-aware timestamps.
+  - **Packaging:** pyarrow is 127 MB and a Lambda allows 250 MB unzipped with its layers. The public AWS SDK for pandas layer (v35 for Python 3.11, 180 MB unzipped) already has pyarrow 24 (pyiceberg needs ≥ 18). pyiceberg and its small dependencies go in a layer of our own, built by a script with Linux wheels.
+- **Malformed messages go to a quarantine table, not back to the queue** (the user's call). A message that doesn't parse or breaks the contract fails the same way on every retry, so retrying it only burns invocations. It's appended to `"00_bronze".simulator_readings_quarantine` with its raw body and `rejection_reasons`: durable and queryable in Athena, where a DLQ keeps messages at most 14 days, one at a time.
+- **Retries and the dead-letter queue are for failures a retry can fix** (a lost commit race, S3 throttling). If a write fails, the Lambda reports those messages in `batchItemFailures` (`ReportBatchItemFailures`), so only they return to the queue. After 3 receives they move to a dead-letter queue, and a CloudWatch alarm on the DLQ's depth emails the SNS topic. A retry after a commit that did land appends the batch again: at-least-once, and silver dedups later.
+- **Concurrency:** each Lambda batch is a commit, and commits race on the table's metadata pointer. The event source mapping allows at most 2 concurrent consumers, and the consumer retries a commit that lost the race.
+- **Small files:** one commit per batch per minute is many small files and snapshots, which is the reason for the compaction in step 7.
+- The notes compare SQS with Kinesis (shards, partition keys, ordering, replay, iterator age).
+
+Built:
+- [`medallion/stream.py`](../src/medallion/stream.py): `simulate_readings` (one reading per station and minute, resends with the same `event_id`, late readings) and `to_bronze_rows` (every SQS record lands in bronze or in its quarantine, asserted), with the bronze and quarantine column contracts. [`config.py`](../src/medallion/config.py) gained `[[streams]]`.
+- Lambdas [`simulate_sensors`](../src/00_bronze/_streaming/lambda_simulate_sensors.py) (shuffles the minute's messages, `SendMessageBatch` in tens) and [`consume_sensor_readings`](../src/00_bronze/_streaming/lambda_consume_sensor_readings.py) (contract check, one pyiceberg `append` per table, a lost commit race reloads and retries, a failed write returns just its messages).
+- Migrations for `"00_bronze".simulator_readings` and `simulator_readings_quarantine`, both `days(_ingested_at)`.
+- [`terraform/streaming.tf`](../terraform/streaming.tf): the queue and its DLQ (`maxReceiveCount` 3, 14 days) with a CloudWatch alarm to SNS, the pyiceberg layer (published from S3), both Lambdas with a role each, the event source mapping (100 messages or 20 s, `ReportBatchItemFailures`, at most 2 consumers), and the simulator schedule (every minute, DISABLED). [`scripts/build_pyiceberg_layer.sh`](../scripts/build_pyiceberg_layer.sh) builds the layer.
+- 62 tests (6 new for the stream split, the simulator and its config; the migrations test now also rejects `''`).
+
+Verified on AWS:
+- **Five hand-made messages** (two readings, a resend, `70.5` in an int column, a body that isn't JSON): 3 rows in bronze, 2 in quarantine with their reasons. They were redelivered twice while the layer was broken (see Learned) and landed on the third receive, one short of the DLQ.
+- **Ten minutes of the simulator** (17:16–17:26 UTC): 37 rows = 33 readings + 4 sensor resends (same `event_id`, different `_message_id`), 0 duplicate SQS deliveries, 1 reading 86 minutes late, 20 Lambda batches, nothing in the DLQ. The schedule was switched on with `aws scheduler update-schedule` and off again 10 minutes later.
+- **What that cost the table:** 22 data files (20 from the stream) averaging 5.6 KB, 22 snapshots, and 77 metadata files (30 `metadata.json`, 23 manifests, 23 manifest lists): **99 files for 40 rows.**
+
+**Learned:**
+- **The public AWS SDK for pandas layer has pyarrow without S3** (no `pyarrow._s3fs`: it uses boto3 for S3). pyiceberg then falls back to `FsspecFileIO` and fails on the missing `s3fs`. The layer now ships pyarrow itself.
+- **The Lambda runtime's glibc limits which wheels work.** `python3.11` runs on Amazon Linux 2 (glibc 2.26); pyarrow wheels after 20.0.0 are `manylinux_2_28`. Pinning pyarrow 20 keeps Python 3.11, like Glue 5.1; the alternative is `python3.12`+ (Amazon Linux 2023).
+- **pyiceberg needs `pyiceberg-core` (Rust) to append to a partitioned table**: the partition transforms (`days(...)`) run there. A dry run that only built the Arrow table missed it; a real append on a throwaway `zz_` table caught it, before and after.
+- **Lambda's 250 MB limit (unzipped, with layers) is tight for pyiceberg:** 231 MB with pyarrow and pyiceberg-core. A zip over 50 MB has to be published from S3. A container image (10 GB) is the way out if it grows.
+- **Spark SQL doesn't accept the SQL-standard `''` inside a string** (it escapes with `\'`). `apply_ddl` failed on a comment; a failed first statement records nothing, so the unapplied migration could still be edited, and a test now rejects `''`.
+- **Iceberg commits are optimistic: write new metadata, then swap the pointer.** pyiceberg writes the new `metadata.json` and manifests first, then asks Glue to move `metadata_location` only if it still points where it did (`UpdateTable` with a version check). Two consumers committing at once: one loses, reloads and retries. The loser's files are left behind: 30 `metadata.json` for 23 table versions points to about 7 lost races (inferred from the count; the logs don't record retries). Without `s3:DeleteObject`, pyiceberg couldn't even delete the manifests of a lost commit.
+- **A micro-batch stream is the small-files problem at its worst:** 99 files for 40 rows. Fewer commits (a longer batching window, up to 300 s; one consumer) trade latency for fewer files; compaction and snapshot expiry (step 7) clean up after. More consumers made it worse here: the event source mapping split each minute's messages into 2 batches.
+- **Malformed data vs failed writes:** a message that can't be stored as sent fails the same way every time, so it's quarantined at once (durable, queryable). A write that fails is retried by SQS and, after 3 receives, parked in the DLQ (14 days, redrive when fixed). Retrying bad data only burns invocations.
+- **At-least-once + idempotent dedup = effectively exactly-once.** Bronze keeps every delivery (`_message_id`) and resend (`event_id`); silver will collapse them on `(station_id, observed_at)`.
+- **SQS vs Kinesis** (Kinesis is blocked on the Free plan):
+
+  | | SQS standard | Kinesis Data Streams |
+  |---|---|---|
+  | Unit of scale | none to manage | shards (1 MB/s or 1,000 records/s in per shard) |
+  | Order | none | per partition key, within a shard |
+  | Delivery | at-least-once; a message is gone once deleted | at-least-once; records stay for the retention (24 h to 365 days) |
+  | Replay | no (a DLQ redrive only) | yes: re-read from any position |
+  | Consumers | competing: each message goes to one consumer | many independent readers of the same data (enhanced fan-out) |
+  | Lag metric | `ApproximateAgeOfOldestMessage` | `IteratorAge` |
+  | Bad records | DLQ after `maxReceiveCount` | a failure blocks the shard unless bisect-on-error / an on-failure destination is set |
 
 ## 7. Iceberg operations
 

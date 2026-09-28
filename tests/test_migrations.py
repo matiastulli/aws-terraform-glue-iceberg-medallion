@@ -18,8 +18,15 @@ def applied_from(migrations):
 def test_the_committed_migrations_are_valid():
     # Runs in CI, so a misplaced, badly named, duplicated or missing migration fails before anyone applies it.
     keys = [m.key for m in load_migrations()]
-    assert keys[:2] == ["bronze_open_meteo_hourly", "bronze_wikidata_population"]
+    assert [k for k in keys if k.startswith("bronze_")] == [
+        "bronze_open_meteo_hourly",
+        "bronze_simulator_readings",
+        "bronze_simulator_readings_quarantine",
+        "bronze_wikidata_population",
+    ]
     assert "silver_readings_quarantine" in keys
+    # Spark SQL escapes a quote in a string with a backslash; the SQL-standard '' fails with PARSE_SYNTAX_ERROR.
+    assert [m.path for m in load_migrations() if "''" in m.sql] == []
 
 
 def test_run_order_is_layer_folders_then_table_then_version():

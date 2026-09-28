@@ -32,6 +32,7 @@ Infrastructure (Terraform ≥ 1.10). `bootstrap/` is applied once with local sta
 terraform -chdir=terraform/bootstrap init && terraform -chdir=terraform/bootstrap apply   # state bucket + budget; needs terraform.tfvars (alert_email)
 terraform -chdir=terraform/bootstrap output -raw backend_hcl > terraform/backend.hcl
 terraform -chdir=terraform init -backend-config=backend.hcl   # the main stack also needs terraform/terraform.tfvars (alert_email, for SNS)
+scripts/build_pyiceberg_layer.sh   # before plan: builds terraform/.build/pyiceberg_layer (Linux wheels, no pyarrow) for consume_sensor_readings
 terraform -chdir=terraform plan -out=tfplan && terraform -chdir=terraform apply tfplan   # review the plan before applying
 terraform -chdir=terraform fmt -recursive && terraform -chdir=terraform validate
 ```
@@ -46,10 +47,12 @@ aws stepfunctions start-execution --state-machine-arn <backfill ARN> --name <sou
 aws stepfunctions start-execution --state-machine-arn <gold_pipeline ARN> --input '{"triggered_by":"manual"}'   # also starts by itself when a source_pipeline execution not named backfill-* succeeds (EventBridge rule)
 aws scheduler update-schedule ...                                           # schedules source_pipeline-<source> are deployed DISABLED; enable one on purpose
 aws glue start-job-run --job-name clean_readings --arguments '{"--batch_id":"<execution name>"}'   # re-clean one bronze batch; a rerun must report new: 0, changed: 0
+aws scheduler get-schedule --name simulate_sensors   # every minute, DISABLED; for a test, update-schedule with the same fields and "State": "ENABLED", then back to DISABLED (terraform apply also resets it)
+aws sqs send-message --queue-url <simulator_readings queue URL> --message-body '{"event_id": …}'   # consume_sensor_readings appends it to 00_bronze.simulator_readings (or the quarantine); logs in /aws/lambda/consume_sensor_readings
 aws glue get-job-run --job-name load_raw_files --run-id <id>                 # job stdout is in CloudWatch /aws-glue/jobs/output/<run id>
 ```
 
-Layout: `config/sources.toml` (sources + stations; names, silver job and lag are derived from it), `src/medallion/` (pure logic, tested), `src/<NN_layer>/<entity>/` holding the entity's migrations `ddl_<table>_v<NNN>_<verb>.sql` and the job that writes it (`glue_job_<process>.py`, `lambda_<process>.py`), `src/00_bronze/_ingestion/` (generic processes that serve every source), `src/ops/schema_migrations/glue_job_apply_ddl.py`, `terraform/` (uploads code to the `artifacts` bucket; Glue jobs use Spark catalog `glue_catalog`), `terraform/state_machines/*.asl.json`.
+Layout: `config/sources.toml` (sources + stations; names, silver job and lag are derived from it), `src/medallion/` (pure logic, tested), `src/<NN_layer>/<entity>/` holding the entity's migrations `ddl_<table>_v<NNN>_<verb>.sql` and the job that writes it (`glue_job_<process>.py`, `lambda_<process>.py`), `src/00_bronze/_ingestion/` (generic processes that serve every source), `src/00_bronze/_streaming/` (the sensor simulator and the SQS consumer, and the pyiceberg layer's requirements), `src/ops/schema_migrations/glue_job_apply_ddl.py`, `terraform/` (uploads code to the `artifacts` bucket; Glue jobs use Spark catalog `glue_catalog`), `terraform/state_machines/*.asl.json`.
 
 Queries go through the `weather-lakehouse` Athena workgroup (enforced result bucket, 1 GiB scan cutoff). **Athena DML needs the numbered databases double-quoted**: `SELECT … FROM "00_bronze".open_meteo_hourly` (unquoted is `MALFORMED_QUERY`). Athena DDL and Spark accept them unquoted; quote them anyway (backticks in DDL and Spark).
 

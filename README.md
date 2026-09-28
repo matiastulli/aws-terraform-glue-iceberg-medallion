@@ -6,22 +6,27 @@ It's the AWS counterpart of [databricks-pyspark-delta-medallion](https://github.
 
 ## Architecture
 
-**Data flow.** Each source's API response lands untouched in S3, then moves through Iceberg tables layer by layer. Silver is written with an idempotent `MERGE` on each entity's key, and invalid rows go to a quarantine table with the rules they broke. Gold is published only after its data quality checks pass. Tables are created and changed only by versioned migrations (`apply_ddl`), never by the jobs that write to them.
+**Data flow.** Each source's API response lands untouched in S3, then moves through Iceberg tables layer by layer. Simulated live sensors take a second path into bronze: an SQS queue and a Lambda that appends with pyiceberg, without Spark. Silver is written with an idempotent `MERGE` on each entity's key, and invalid rows go to a quarantine table with the rules they broke. Gold is published only after its data quality checks pass. Tables are created and changed only by versioned migrations (`apply_ddl`), never by the jobs that write to them.
 
 ```mermaid
 flowchart LR
     om["Open-Meteo archive<br/>hourly weather"] --> ingest
     wd["Wikidata SPARQL<br/>city population"] --> ingest
     ingest["Lambda<br/>ingest_source"] --> raw[("S3 raw<br/>JSON as received")]
+    sim["Lambda<br/>simulate_sensors<br/>every minute"] --> sqs["SQS<br/>simulator_readings"] --> consume["Lambda<br/>consume_sensor_readings<br/>pyiceberg"]
+    sqs -. "write failed 3 times" .-> dlq["SQS<br/>simulator_readings-dlq"] -. alarm .-> sns["SNS<br/>email alert"]
 
     subgraph lakehouse["Apache Iceberg tables on S3, in the Glue Data Catalog"]
-        bronze[("00_bronze<br/>open_meteo_hourly<br/>wikidata_population")]
+        bronze[("00_bronze<br/>open_meteo_hourly<br/>wikidata_population<br/>simulator_readings")]
+        bquarantine[("00_bronze<br/>simulator_readings_quarantine")]
         silver[("01_silver<br/>readings · populations")]
         quarantine[("01_silver<br/>*_quarantine")]
         gold[("02_gold<br/>agg_readings_daily")]
     end
 
     raw --> load["Glue<br/>load_raw_files"] -- append --> bronze
+    consume -- "append<br/>one commit per batch" --> bronze
+    consume -- malformed --> bquarantine
     bronze --> clean["Glue<br/>clean_readings<br/>clean_populations"]
     clean -- MERGE --> silver
     clean -- rejects --> quarantine
@@ -97,6 +102,8 @@ Each `source_pipeline` execution takes `{"source": "<bronze table>", "date": "YY
 3. **Clean** (the source's `silver_job` in config): flattens, validates and deduplicates the batch, then `MERGE`s it into `"01_silver".<entity>`, with rejects in `"01_silver".<entity>_quarantine`. A rerun of the same batch writes nothing.
 
 When it succeeds, an EventBridge rule starts `gold_pipeline`, which rebuilds `"02_gold".agg_readings_daily` in the order compute → data quality checks → write. It writes only if every check passes and something changed. Schedules (EventBridge Scheduler, one per source) are deployed disabled; failures go to the SNS topic `weather-lakehouse-alerts`.
+
+**Live readings:** `simulate_sensors` (Lambda, every minute through EventBridge Scheduler, deployed disabled) sends one reading per station to the SQS queue `simulator_readings`, and on purpose resends some and sends some late, at the rates in `[[streams]]` in the config. The SQS event source mapping calls `consume_sensor_readings` with up to 100 messages or 20 seconds of them, at most 2 at a time. It appends each batch to `"00_bronze".simulator_readings` with pyiceberg, one Iceberg commit per batch, and malformed messages (not JSON, an unknown field, a wrong type) to `simulator_readings_quarantine` with their raw body. A failed write sends just its messages back to the queue; after 3 receives they go to the dead-letter queue, which has an alarm. The pyiceberg layer is built with `scripts/build_pyiceberg_layer.sh`; pyarrow comes from the public AWS SDK for pandas layer.
 
 **Backfill:** the `backfill` state machine takes `{"source": …, "start_date": …, "end_date": …}` (inclusive, at most 31 days) and starts one `source_pipeline` execution per date, two at a time, so every date is its own batch that fails and alerts on its own. It then runs `gold_pipeline` once; its per-date executions are named `backfill-<date>-…`, which the EventBridge rule skips. A rerun is safe: silver's `MERGE` reports 0 new and 0 changed rows.
 
