@@ -68,7 +68,12 @@ totals = {"batches": 0, "input_rows": 0, "new": 0, "changed": 0, "unchanged": 0,
 
 def clean_batch(bronze: DataFrame, batch_id: int) -> None:
     """One micro-batch, the same way the batch silver jobs clean one bronze batch. An exception fails the query before
-    the checkpoint records this batch, so the next run gets it again."""
+    the checkpoint records this batch, so the next run gets it again.
+
+    Everything here runs on the micro-batch's own session (bronze.sparkSession), not the outer `spark`: foreachBatch
+    hands over a DataFrame from a cloned session, so a temp view registered from it isn't visible to spark.sql
+    (TABLE_OR_VIEW_NOT_FOUND on AWS; the initial load, a plain batch DataFrame, didn't show it)."""
+    session = bronze.sparkSession
     # Step 4: Validate each micro-batch: add rejection reasons and observed_at, then split valid vs rejected rows.
     checked = entity.add_rejection_reasons(entity.add_observed_at(bronze)).cache()
     valid, rejected = split_valid_and_rejected(checked)
@@ -85,12 +90,12 @@ def clean_batch(bronze: DataFrame, batch_id: int) -> None:
     # Step 7: Narrow the comparison to the same time window as this batch, then classify each row as new/changed/unchanged.
     # silver bounded to the batch's minutes, and the same literal range in the MERGE's ON (step 3's review fix).
     bounds = batch_bounds(updates, "observed_at")
-    current = spark.table(silver_table).where(between_sql("observed_at", bounds))
+    current = session.table(silver_table).where(between_sql("observed_at", bounds))
     classified = classify_changes(updates, current, entity.KEY, MEASURES).cache()
     counts |= change_counts(classified)
 
     # Step 8: Identify rows that should be added to the quarantine table.
-    to_quarantine = new_rejects(rejects, spark.table(quarantine_table), entity.QUARANTINE_MATCH).cache()
+    to_quarantine = new_rejects(rejects, session.table(quarantine_table), entity.QUARANTINE_MATCH).cache()
     counts["quarantined_now"] = to_quarantine.count()
 
     # Step 9: Create temp views for the MERGE sources.
@@ -99,9 +104,9 @@ def clean_batch(bronze: DataFrame, batch_id: int) -> None:
 
     # Step 10: Apply the silver MERGE and quarantine MERGE only when there are rows to write.
     if counts["new"] + counts["changed"]:
-        spark.sql(merge_sql(silver_table, "clean_sensor_readings_updates", entity.KEY, MEASURES, between_sql("t.observed_at", bounds)))
+        session.sql(merge_sql(silver_table, "clean_sensor_readings_updates", entity.KEY, MEASURES, between_sql("t.observed_at", bounds)))
     if counts["quarantined_now"]:
-        spark.sql(quarantine_merge_sql(quarantine_table, "clean_sensor_readings_rejects", entity.QUARANTINE_MATCH))
+        session.sql(quarantine_merge_sql(quarantine_table, "clean_sensor_readings_rejects", entity.QUARANTINE_MATCH))
 
     # Step 11: Accumulate the batch totals for the final summary.
     totals["batches"] += 1

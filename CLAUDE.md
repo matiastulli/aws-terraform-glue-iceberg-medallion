@@ -50,6 +50,9 @@ aws glue start-job-run --job-name clean_readings --arguments '{"--batch_id":"<ex
 aws scheduler get-schedule --name simulate_sensors   # every minute, DISABLED; for a test, update-schedule with the same fields and "State": "ENABLED", then back to DISABLED (terraform apply also resets it)
 aws sqs send-message --queue-url <simulator_readings queue URL> --message-body '{"event_id": …}'   # consume_sensor_readings appends it to 00_bronze.simulator_readings (or the quarantine); logs in /aws/lambda/consume_sensor_readings
 aws glue start-job-run --job-name maintain_tables --arguments '{"--tables":"01_silver.readings"}'   # compact, expire (> 7 days, keep 5), orphans (> 3 days); --rewrite_all true after a partition change; weekly schedule deployed DISABLED
+aws glue start-job-run --job-name clean_sensor_readings   # stream bronze simulator_readings -> silver sensor_readings (once); watermark in DynamoDB; never delete its checkpoint (s3://<lake>/_checkpoints/)
+aws dynamodb get-item --table-name weather-lakehouse-watermarks --key '{"process": {"S": "clean_sensor_readings"}}'   # where the stream stopped
+aws dynamodb scan --table-name weather-lakehouse-latest-readings   # newest reading per station (one item each)
 aws sts assume-role --role-arn "$(terraform -chdir=terraform output -raw analyst_role_arn)" --role-session-name analyst   # query gold as the analyst (Lake Formation: no population, mainland stations only); never print the credentials
 aws cloudtrail lookup-events --lookup-attributes AttributeKey=EventName,AttributeValue=GetDataAccess   # audit: Lake Formation credential vending per query (90-day event history, no trail)
 aws glue get-job-run --job-name load_raw_files --run-id <id>                 # job stdout is in CloudWatch /aws-glue/jobs/output/<run id>

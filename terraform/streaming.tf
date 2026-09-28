@@ -151,8 +151,9 @@ resource "aws_lambda_function" "consume_sensor_readings" {
 
   environment {
     variables = {
-      STREAM    = local.stream
-      BRONZE_DB = aws_glue_catalog_database.this["00_bronze"].name
+      STREAM       = local.stream
+      BRONZE_DB    = aws_glue_catalog_database.this["00_bronze"].name
+      LATEST_TABLE = aws_dynamodb_table.latest_readings.name
     }
   }
   depends_on = [aws_cloudwatch_log_group.streaming]
@@ -209,6 +210,11 @@ data "aws_iam_policy_document" "consume_sensor_readings" {
     sid       = "ReadQueue"
     actions   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
     resources = [aws_sqs_queue.stream.arn]
+  }
+  statement {
+    sid       = "PublishLatestReadings"
+    actions   = ["dynamodb:UpdateItem"]
+    resources = [aws_dynamodb_table.latest_readings.arn]
   }
   statement {
     sid     = "CommitToTheStreamTables"

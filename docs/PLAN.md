@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits. Later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–8 done, step 9 next
+**Status:** steps 0–9 done, step 10 next
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -16,8 +16,8 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 6. Near real-time | ✅ Done | Simulated live sensors → SQS → Lambda (pyiceberg + pyarrow) → Iceberg, with late and duplicate events (Kinesis isn't available on the Free plan) |
 | 7. Iceberg operations | ✅ Done | Schema evolution, partition evolution, time travel and rollback, compaction and snapshot expiry, measured with Athena bytes scanned |
 | 8. Governance | ✅ Done | Lake Formation permissions, LF-tags, a column/row filter, and CloudTrail audit |
-| 9. Spark Structured Streaming | ⏳ Next | A Glue job with `trigger(availableNow)` and an S3 checkpoint over landed files, the Auto Loader equivalent, plus a DynamoDB watermark |
-| 10. Complete tests | | The remaining transformations and edge cases |
+| 9. Spark Structured Streaming | ✅ Done | A Glue job with `trigger(availableNow)` and an S3 checkpoint over landed files, the Auto Loader equivalent, plus a DynamoDB watermark |
+| 10. Complete tests | ⏳ Next | The remaining transformations and edge cases |
 
 **Timebox:** the interview is on 2026-09-29, two days after step 0. Steps 1–4 are day 1 and steps 5–8 are day 2. Anything that doesn't fit stays planned here.
 
@@ -519,5 +519,26 @@ Design:
 - **DynamoDB table `weather-lakehouse-watermarks`** (on-demand, key `process`). After the query ends without error, the job writes `source_table`, `snapshot_id`, `snapshot_committed_at` (UTC) and the run's counts, on condition that `snapshot_committed_at` doesn't go backwards. A failed run writes nothing, so the watermark only advances after the checks pass.
 - **`maintain_tables`** reads the watermarks and, for a table a stream reads, expires only snapshots older than the watermark's `snapshot_committed_at` (the earlier of that and its own cutoff). The cutoff choice is a pure, tested function.
 - An hourly schedule for the job, deployed DISABLED.
+- **Added after a question from the user** ("I expected one row per station"): a second DynamoDB table, `weather-lakehouse-latest-readings`, keyed `station_id`, with each station's newest reading, for an app that asks "how is Ushuaia now?" by key. `consume_sensor_readings` updates it after each bronze commit, one conditional write per station per batch (only if `observed_at` is newer), so a late reading never replaces the current one. It's a view derived from bronze: if it fails, the error is logged and the messages are not returned to the queue. I had only offered two variants of the watermark; this option should have been on the list.
+
+Built:
+- [`medallion/sensor_readings.py`](../src/medallion/sensor_readings.py) (parse the sensor's ISO time, null-explicit rules with `readings`' ranges, key and tiebreak, quarantine once per `_message_id`), `dedup_latest` gained a `tiebreak`, `maintenance.expire_cutoff`, and `stream.latest_per_station` (normalized `observed_at`, so DynamoDB compares strings). 75 tests.
+- Glue job [`clean_sensor_readings`](../src/01_silver/sensor_readings/glue_job_clean_sensor_readings.py), migrations for `sensor_readings` and its quarantine, [`terraform/dynamodb.tf`](../terraform/dynamodb.tf) (both tables, on-demand), `maintain_tables` reading the watermarks, the consumer Lambda publishing the latest readings.
+
+Verified on AWS:
+- **First run** (no checkpoint): the initial load read bronze's 40 rows → 32 readings in silver (8 duplicates on the key: 4 sensor resends, the hand-made `test-1` resend, 3 minutes where the simulator ran twice). No watermark was written (no stream offset on a run with nothing new after the load): fixed so a first run records the initial load's snapshot.
+- **Second run failed:** `TABLE_OR_VIEW_NOT_FOUND` inside `foreachBatch` (see Learned). The micro-batch wasn't committed to the checkpoint and DynamoDB wasn't touched.
+- **Third run** (fixed): 18 rows, 18 new; the watermark appeared (`2026-09-28T20:06:41Z`), but the 2 minutes of newer data weren't read (see Learned). **Fourth run:** 12 rows, 6 new, watermark → `20:14:49Z`.
+- **The guard:** `maintain_tables --expire_older_than_days 0 --retain_last 1` on bronze reported `held_by_stream: true`, expired up to `20:14:49` only (14 snapshots → 3, the watermark's now the oldest), compacted 13 files into 1. **The next stream run after it read the one new row** (silver 57 rows) and moved the watermark to `20:20:32Z`.
+- **Latest readings:** current readings for the 3 stations → 3 items; a reading 45 minutes late for `buenos_aires` → `late_skipped: 1`, the item kept the current one, and bronze still got the late row. (A first test sent 3 malformed messages by mistake, a zsh word-splitting slip in the test script: they went to bronze's quarantine as `not JSON`, as designed.)
+
+**Learned:**
+- **Iceberg as a streaming source:** `readStream.format("iceberg")` reads appended snapshots only. `replace` snapshots (compaction) are skipped, so compaction doesn't disturb a stream, but a stream started on a table whose history is only `replace` snapshots reads nothing: an initial batch load + `stream-from-timestamp` covers it, and the `MERGE` absorbs the overlap.
+- **`availableNow` vs `once` with Iceberg:** availableNow plans from the stream's initial offset, so expiring the table's first snapshot broke the stream for good; `once` only needs the last consumed snapshot. The newer trigger isn't always the safer one.
+- **Expiry and streams must be coordinated:** a snapshot the checkpoint still needs must not expire. The DynamoDB watermark is the contract between the stream and the maintenance job, rather than the maintenance job reading Spark's checkpoint files.
+- **`foreachBatch` runs on a cloned SparkSession:** a temp view registered from the micro-batch DataFrame isn't visible to the outer `spark.sql`. Use `batch_df.sparkSession`.
+- **A restarted stream re-runs the planned batch first:** Spark writes a batch's offsets (offset log) before running it and marks it done after (commit log). After a failure, the restart replays that batch with the same offsets, so a retry sees exactly the same data; with `once`, that's the whole run, and newer data waits for the next one.
+- **DynamoDB conditional writes make updates monotonic** (the watermark and the latest readings only move forward) atomically on the server, with no read-then-write race. Pick the key from the question: `process` for "where is this stream?", `station_id` for "how is this station now?". History and aggregates belong in Iceberg + Athena; DynamoDB serves reads by key.
+- `collect()` returns local-time timestamps, again: build time cutoffs in Spark (UTC session), not in Python.
 
 ## 10. Complete tests

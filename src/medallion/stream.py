@@ -116,3 +116,34 @@ def to_bronze_rows(records: list[dict], batch_id: str, ingested_at: dt.datetime)
     if len(rows) + len(rejects) != len(records):
         raise ValueError(f"{len(records)} records became {len(rows)} rows and {len(rejects)} rejects")
     return rows, rejects
+
+
+def _observed_at(value) -> dt.datetime | None:
+    """The sensor's time string as an aware UTC datetime, or None when it isn't one (silver quarantines those)."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(dt.timezone.utc) if parsed.tzinfo else None
+
+
+def latest_per_station(rows: list[dict]) -> dict[str, dict]:
+    """The newest reading of each station in a batch, for the latest-readings table (one DynamoDB item per station).
+
+    observed_at is normalized to `YYYY-MM-DDTHH:MM:SSZ`, so the table can compare it as a string: the conditional write
+    that keeps a late reading from replacing a newer one depends on it. Rows without a station or a parseable time are
+    left out; silver quarantines them."""
+    latest: dict[str, tuple[dt.datetime, dict]] = {}
+    for row in rows:
+        observed_at = _observed_at(row.get("observed_at"))
+        if row.get("station_id") is None or observed_at is None:
+            continue
+        current = latest.get(row["station_id"])
+        if current is None or observed_at > current[0]:
+            latest[row["station_id"]] = (observed_at, row)
+    return {
+        station: {name: row.get(name) for name, _ in MESSAGE_FIELDS} | {"observed_at": observed_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "_sent_at": row["_sent_at"]}
+        for station, (observed_at, row) in latest.items()
+    }

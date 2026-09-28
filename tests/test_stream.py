@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from medallion.config import Station, Stream, parse_config
-from medallion.stream import BRONZE_COLUMNS, QUARANTINE_COLUMNS, simulate_readings, to_bronze_rows
+from medallion.stream import BRONZE_COLUMNS, QUARANTINE_COLUMNS, latest_per_station, simulate_readings, to_bronze_rows
 
 NOW = dt.datetime(2026, 9, 28, 14, 7, 42, tzinfo=dt.timezone.utc)
 INGESTED = dt.datetime(2026, 9, 28, 14, 8, 5, tzinfo=dt.timezone.utc)
@@ -94,3 +94,21 @@ def test_a_stream_with_an_impossible_rate_is_rejected():
     text = (Path(__file__).parents[1] / "config" / "sources.toml").read_text(encoding="utf-8").replace("late_rate = 0.1", "late_rate = 1.5")
     with pytest.raises(ValueError, match="rates must be between 0 and 1"):
         parse_config(text)
+
+
+def test_only_the_newest_reading_of_each_station_is_published():
+    records = [
+        record("m1", GOOD | {"observed_at": "2026-09-28T14:07:00Z", "temperature_c": 18.5}),
+        record("m2", GOOD | {"event_id": "e-late", "observed_at": "2026-09-28T12:40:00Z", "temperature_c": 11.0}),  # a late reading
+        record("m3", GOOD | {"event_id": "e-u", "station_id": "ushuaia", "observed_at": "2026-09-28T14:06:00+00:00"}),
+        record("m4", GOOD | {"event_id": "e-bad", "station_id": "cordoba", "observed_at": "yesterday"}),  # silver quarantines it
+        record("m5", GOOD | {"event_id": "e-naive", "station_id": "cordoba", "observed_at": "2026-09-28T14:07:00"}),  # no zone: ambiguous
+    ]
+    rows, _ = to_bronze_rows(records, "batch-1", INGESTED)
+
+    latest = latest_per_station(rows)
+
+    assert sorted(latest) == ["buenos_aires", "ushuaia"]
+    assert latest["buenos_aires"]["temperature_c"] == 18.5
+    # Normalized, so the table can compare times as strings.
+    assert latest["ushuaia"]["observed_at"] == "2026-09-28T14:06:00Z"
