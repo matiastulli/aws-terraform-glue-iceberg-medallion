@@ -99,6 +99,10 @@ Adopted from `~/Code/databricks-pyspark-delta-medallion` and translated to AWS. 
 - **Interview on 2026-09-29:** go deep on Iceberg, Glue, Athena and Step Functions, and add a "Learned:" note for anything that would make a good interview answer.
 - Add commands to this file as each step introduces them. Don't document commands that don't exist yet.
 
+## Checks
+
+Before saying a step is done: `.venv/bin/pytest` (with `JAVA_HOME` on Java 17) and `terraform -chdir=terraform fmt -recursive && terraform -chdir=terraform validate`. The learning path is tracked in `docs/PLAN.md`, not in `docs/plans/`.
+
 ## Agents
 
 `.claude/agents/reviewer.md` and `security.md` hold this repo's review checklist and leak checks; they override the global agents of the same name in `~/.claude`. Every repo keeps these two and no others.

@@ -28,3 +28,6 @@ tfplan
 
 # Terraform build output (zips for Lambda and Glue)
 .build/
+
+# Claude Code local settings and macOS
+.claude/settings.local.json
